@@ -1,5 +1,4 @@
 import Basic
-import Build
 import Utility
 import POSIX
 
@@ -146,15 +145,18 @@ public struct Destination {
     /// Cache storage for sdk platform path.
     private static var _sdkPlatformFrameworkPath: AbsolutePath? = nil
 
-    /// Target triple for the host system.
-    private static let hostTargetTriple = Triple.hostTriple.tripleString
-
   #if os(macOS)
     /// Returns the host's dynamic library extension.
     public static let hostDynamicLibraryExtension = "dylib"
+
+    /// Target triple for the host system.
+    private static let hostTargetTriple = "x86_64-apple-macosx10.10"
   #else
     /// Returns the host's dynamic library extension.
     public static let hostDynamicLibraryExtension = "so"
+
+    /// Target triple for the host system.
+    private static let hostTargetTriple = "x86_64-unknown-linux"
   #endif
 }
 
