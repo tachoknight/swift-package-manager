@@ -8,11 +8,11 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
-import Utility
+import TSCBasic
+import TSCUtility
 
 // Re-export Version from PackageModel, since it is a key part of the model.
-@_exported import struct Utility.Version
+@_exported import struct TSCUtility.Version
 
 /// The basic package representation.
 ///
@@ -86,9 +86,20 @@ public final class Package {
         self.testTargetSearchPath = testTargetSearchPath
     }
 
-    public enum Error: Swift.Error {
+    public enum Error: Swift.Error, Equatable {
         case noManifest(baseURL: String, version: String?)
-        case noOrigin(String)
+    }
+}
+extension Package.Error: CustomStringConvertible {
+   public var description: String {
+        switch self {
+        case .noManifest(let baseURL, let version):
+            var string = "\(baseURL) has no Package.swift manifest"
+            if let version = version {
+                string += " for version \(version)"
+            }
+            return string
+        }
     }
 }
 
@@ -98,25 +109,121 @@ extension Package: CustomStringConvertible {
     }
 }
 
-extension Package: Hashable, Equatable {
-    public var hashValue: Int { return ObjectIdentifier(self).hashValue }
-    
-    public static func == (lhs: Package, rhs: Package) -> Bool {
-        return ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
-    }
+extension Package: ObjectIdentifierProtocol {
 }
 
-extension Package.Error: Equatable {
-    public static func == (lhs: Package.Error, rhs: Package.Error) -> Bool {
-        switch (lhs, rhs) {
-        case let (.noManifest(lhs), .noManifest(rhs)):
-            return lhs.baseURL == rhs.baseURL && lhs.version == rhs.version
-        case (.noManifest, _):
-            return false
-        case let (.noOrigin(lhs), .noOrigin(rhs)):
-            return lhs == rhs
-        case (.noOrigin, _):
-            return false
+/// A package reference.
+///
+/// This represents a reference to a package containing its identity and location.
+public struct PackageReference: JSONMappable, JSONSerializable, Codable, CustomStringConvertible, Equatable, Hashable {
+    public typealias PackageIdentity = String
+
+    /// The kind of package reference.
+    public enum Kind: String, Codable {
+        /// A root package.
+        case root
+
+        /// A non-root local package.
+        case local
+
+        /// A remote package.
+        case remote
+    }
+
+    /// Compute identity of a package given its URL.
+    public static func computeIdentity(packageURL: String) -> String {
+        return computeDefaultName(fromURL: packageURL).lowercased()
+    }
+
+    /// Compute the default name of a package given its URL.
+    public static func computeDefaultName(fromURL url: String) -> String {
+      #if os(Windows)
+        let isSeparator : (Character) -> Bool = { $0 == "/" || $0 == "\\" }
+      #else
+        let isSeparator : (Character) -> Bool = { $0 == "/" }
+      #endif
+       
+        // Get the last path component of the URL.
+        // Drop the last character in case it's a trailing slash.
+        var endIndex = url.endIndex
+        if let lastCharacter = url.last, isSeparator(lastCharacter) {
+            endIndex = url.index(before: endIndex)
         }
+
+        let separatorIndex = url[..<endIndex].lastIndex(where: isSeparator)
+        let startIndex = separatorIndex.map { url.index(after: $0) } ?? url.startIndex
+        var lastComponent = url[startIndex..<endIndex]
+
+        // Strip `.git` suffix if present.
+        if lastComponent.hasSuffix(".git") {
+            lastComponent = lastComponent.dropLast(4)
+        }
+
+        return String(lastComponent)
+    }
+
+    /// The identity of the package.
+    public let identity: PackageIdentity
+
+    /// The name of the package, if available.
+    public var name: String {
+        _name ?? Self.computeDefaultName(fromURL: path)
+    }
+    private let _name: String?
+
+    /// The path of the package.
+    ///
+    /// This could be a remote repository, local repository or local package.
+    public let path: String
+
+    /// The kind of package: root, local, or remote.
+    public let kind: Kind
+
+    /// Create a package reference given its identity and repository.
+    public init(identity: String, path: String, name: String? = nil, kind: Kind = .remote) {
+        assert(identity == identity.lowercased(), "The identity is expected to be lowercased")
+        self._name = name
+        self.identity = identity
+        self.path = path
+        self.kind = kind
+    }
+
+    public static func ==(lhs: PackageReference, rhs: PackageReference) -> Bool {
+        return lhs.identity == rhs.identity
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(identity)
+    }
+
+    public init(json: JSON) throws {
+        self._name = json.get("name")
+        self.identity = try json.get("identity")
+        self.path = try json.get("path")
+
+        // Support previous version of PackageReference that contained an `isLocal` property.
+        if let isLocal: Bool = json.get("isLocal") {
+            kind = isLocal ? .local : .remote
+        } else {
+            kind = try Kind(rawValue: json.get("kind"))!
+        }
+    }
+
+    public func toJSON() -> JSON {
+        return .init([
+            "name": name.toJSON(),
+            "identity": identity,
+            "path": path,
+            "kind": kind.rawValue,
+        ])
+    }
+
+    /// Create a new package reference object with the given name.
+    public func with(newName: String) -> PackageReference {
+        return PackageReference(identity: identity, path: path, name: newName, kind: kind)
+    }
+
+    public var description: String {
+        return identity + (path.isEmpty ? "" : "[\(path)]")
     }
 }

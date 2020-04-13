@@ -10,57 +10,72 @@
 
 import XCTest
 
-import TestSupport
-import Basic
+import SPMTestSupport
+import TSCBasic
 import Commands
+import Workspace
+
+struct BuildResult {
+    let binPath: AbsolutePath
+    let output: String
+    let binContents: [String]
+}
 
 final class BuildToolTests: XCTestCase {
     @discardableResult
-    private func execute(_ args: [String], packagePath: AbsolutePath? = nil) throws -> String {
-        return try SwiftPMProduct.SwiftBuild.execute(args, packagePath: packagePath, printIfError: true)
+    private func execute(
+        _ args: [String],
+        packagePath: AbsolutePath? = nil
+    ) throws -> (stdout: String, stderr: String) {
+        return try SwiftPMProduct.SwiftBuild.execute(args, packagePath: packagePath)
     }
 
-    func buildBinContents(_ args: [String], packagePath: AbsolutePath? = nil) throws -> [String] {
-        try execute(args, packagePath: packagePath)
-        defer { try! SwiftPMProduct.SwiftPackage.execute(["clean"], packagePath: packagePath, printIfError: true) }
-        let binPathOutput = try execute(["--show-bin-path"], packagePath: packagePath)
+    func build(_ args: [String], packagePath: AbsolutePath? = nil) throws -> BuildResult {
+        let (output, _) = try execute(args, packagePath: packagePath)
+        defer { try! SwiftPMProduct.SwiftPackage.execute(["clean"], packagePath: packagePath) }
+        let (binPathOutput, _) = try execute(["--show-bin-path"], packagePath: packagePath)
         let binPath = AbsolutePath(binPathOutput.trimmingCharacters(in: .whitespacesAndNewlines))
         let binContents = try localFileSystem.getDirectoryContents(binPath)
-        return binContents
+        return BuildResult(binPath: binPath, output: output, binContents: binContents)
     }
     
     func testUsage() throws {
-        XCTAssert(try execute(["-help"]).contains("USAGE: swift build"))
+        XCTAssert(try execute(["-help"]).stdout.contains("USAGE: swift build"))
     }
 
     func testSeeAlso() throws {
-        XCTAssert(try execute(["--help"]).contains("SEE ALSO: swift run, swift package, swift test"))
+        XCTAssert(try execute(["--help"]).stdout.contains("SEE ALSO: swift run, swift package, swift test"))
     }
 
     func testVersion() throws {
-        XCTAssert(try execute(["--version"]).contains("Swift Package Manager"))
+        XCTAssert(try execute(["--version"]).stdout.contains("Swift Package Manager"))
     }
 
-    func testBinPath() throws {
-        fixture(name: "ValidLayouts/SingleModule/Executable") { path in
+    func testBinPathAndSymlink() throws {
+        fixture(name: "ValidLayouts/SingleModule/ExecutableNew") { path in
             let fullPath = resolveSymlinks(path)
-            let targetPath = fullPath.appending(components: ".build", Destination.host.target)
-            XCTAssertEqual(try execute(["--show-bin-path"], packagePath: fullPath),
-                           targetPath.appending(components: "debug").asString + "\n")
-            XCTAssertEqual(try execute(["-c", "release", "--show-bin-path"], packagePath: fullPath),
-                           targetPath.appending(components: "release").asString + "\n")
-        }
-    }
+            let targetPath = fullPath.appending(components: ".build", Resources.default.toolchain.triple.tripleString)
+            let xcbuildTargetPath = fullPath.appending(components: ".build", "apple")
+            XCTAssertEqual(try execute(["--show-bin-path"], packagePath: fullPath).stdout,
+                           "\(targetPath.appending(component: "debug").pathString)\n")
+            XCTAssertEqual(try execute(["-c", "release", "--show-bin-path"], packagePath: fullPath).stdout,
+                           "\(targetPath.appending(component: "release").pathString)\n")
 
-    func testBackwardsCompatibilitySymlink() throws {
-        fixture(name: "ValidLayouts/SingleModule/Executable") { path in
-            let fullPath = resolveSymlinks(path)
-            let targetPath = fullPath.appending(components: ".build", Destination.host.target)
+            // Print correct path when building with XCBuild.
+            let xcodeDebugOutput = try execute(["--build-system", "xcode", "--show-bin-path"], packagePath: fullPath).stdout
+            let xcodeReleaseOutput = try execute(["--build-system", "xcode", "-c", "release", "--show-bin-path"], packagePath: fullPath).stdout
+          #if os(macOS)
+            XCTAssertEqual(xcodeDebugOutput, "\(xcbuildTargetPath.appending(components: "Products", "Debug").pathString)\n")
+            XCTAssertEqual(xcodeReleaseOutput, "\(xcbuildTargetPath.appending(components: "Products", "Release").pathString)\n")
+          #else
+            XCTAssertEqual(xcodeDebugOutput, "\(targetPath.appending(component: "debug").pathString)\n")
+            XCTAssertEqual(xcodeReleaseOutput, "\(targetPath.appending(component: "release").pathString)\n")
+          #endif
 
+            // Test symlink.
             _ = try execute([], packagePath: fullPath)
             XCTAssertEqual(resolveSymlinks(fullPath.appending(components: ".build", "debug")),
                            targetPath.appending(component: "debug"))
-
             _ = try execute(["-c", "release"], packagePath: fullPath)
             XCTAssertEqual(resolveSymlinks(fullPath.appending(components: ".build", "release")),
                            targetPath.appending(component: "release"))
@@ -72,17 +87,23 @@ final class BuildToolTests: XCTestCase {
             let fullPath = resolveSymlinks(path)
 
             do {
-                let productBinContents = try buildBinContents(["--product", "exec1"], packagePath: fullPath)
-                XCTAssert(productBinContents.contains("exec1"))
-                XCTAssert(!productBinContents.contains("exec2.build"))
+                let result = try build(["--product", "exec1"], packagePath: fullPath)
+                XCTAssert(result.binContents.contains("exec1"))
+                XCTAssert(!result.binContents.contains("exec2.build"))
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
                 XCTFail(stderr)
             }
 
             do {
-                let targetBinContents = try buildBinContents(["--target", "exec2"], packagePath: fullPath)
-                XCTAssert(targetBinContents.contains("exec2.build"))
-                XCTAssert(!targetBinContents.contains("exec1"))
+                let (_, stderr) = try execute(["--product", "lib1"], packagePath: fullPath)
+                try SwiftPMProduct.SwiftPackage.execute(["clean"], packagePath: fullPath)
+                XCTAssertMatch(stderr, .contains("'--product' cannot be used with the automatic product 'lib1'; building the default target instead"))
+            }
+
+            do {
+                let result = try build(["--target", "exec2"], packagePath: fullPath)
+                XCTAssert(result.binContents.contains("exec2.build"))
+                XCTAssert(!result.binContents.contains("exec1"))
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
                 XCTFail(stderr)
             }
@@ -136,11 +157,11 @@ final class BuildToolTests: XCTestCase {
             let aPath = path.appending(component: "A")
 
             do {
-                let binContents = try buildBinContents([], packagePath: aPath)
-                XCTAssert(!binContents.contains("bexec"))
-                XCTAssert(!binContents.contains("BTarget2.build"))
-                XCTAssert(!binContents.contains("cexec"))
-                XCTAssert(!binContents.contains("CTarget.build"))
+                let result = try build([], packagePath: aPath)
+                XCTAssert(!result.binContents.contains("bexec"))
+                XCTAssert(!result.binContents.contains("BTarget2.build"))
+                XCTAssert(!result.binContents.contains("cexec"))
+                XCTAssert(!result.binContents.contains("CTarget.build"))
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
                 XCTFail(stderr)
             }
@@ -148,15 +169,26 @@ final class BuildToolTests: XCTestCase {
             // Dependency contains a dependent product
 
             do {
-                let binContents = try buildBinContents(["--product", "bexec"], packagePath: aPath)
-                XCTAssert(binContents.contains("BTarget2.build"))
-                XCTAssert(binContents.contains("bexec"))
-                XCTAssert(!binContents.contains("aexec"))
-                XCTAssert(!binContents.contains("ATarget.build"))
-                XCTAssert(!binContents.contains("BLibrary.a"))
-                XCTAssert(!binContents.contains("BTarget1.build"))
-                XCTAssert(!binContents.contains("cexec"))
-                XCTAssert(!binContents.contains("CTarget.build"))
+                let result = try build(["--product", "bexec"], packagePath: aPath)
+                XCTAssert(result.binContents.contains("BTarget2.build"))
+                XCTAssert(result.binContents.contains("bexec"))
+                XCTAssert(!result.binContents.contains("aexec"))
+                XCTAssert(!result.binContents.contains("ATarget.build"))
+                XCTAssert(!result.binContents.contains("BLibrary.a"))
+
+                // FIXME: We create the modulemap during build planning, hence this uglyness.
+                let bTargetBuildDir = ((try? localFileSystem.getDirectoryContents(result.binPath.appending(component: "BTarget1.build"))) ?? []).filter{ $0 != moduleMapFilename }
+                XCTAssertEqual(bTargetBuildDir, [])
+
+                XCTAssert(!result.binContents.contains("cexec"))
+                XCTAssert(!result.binContents.contains("CTarget.build"))
+
+                // Also make sure we didn't emit parseable module interfaces
+                // (do this here to avoid doing a second build in
+                // testParseableInterfaces().
+                XCTAssert(!result.binContents.contains("ATarget.swiftinterface"))
+                XCTAssert(!result.binContents.contains("BTarget.swiftinterface"))
+                XCTAssert(!result.binContents.contains("CTarget.swiftinterface"))
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
                 XCTFail(stderr)
             }
@@ -164,27 +196,34 @@ final class BuildToolTests: XCTestCase {
             // Dependency does not contain a dependent product
 
             do {
-                let binContents = try buildBinContents(["--target", "CTarget"], packagePath: aPath)
-                XCTAssert(binContents.contains("CTarget.build"))
-                XCTAssert(!binContents.contains("aexec"))
-                XCTAssert(!binContents.contains("ATarget.build"))
-                XCTAssert(!binContents.contains("BLibrary.a"))
-                XCTAssert(!binContents.contains("bexec"))
-                XCTAssert(!binContents.contains("BTarget1.build"))
-                XCTAssert(!binContents.contains("BTarget2.build"))
-                XCTAssert(!binContents.contains("cexec"))
+                let result = try build(["--target", "CTarget"], packagePath: aPath)
+                XCTAssert(result.binContents.contains("CTarget.build"))
+                XCTAssert(!result.binContents.contains("aexec"))
+                XCTAssert(!result.binContents.contains("ATarget.build"))
+                XCTAssert(!result.binContents.contains("BLibrary.a"))
+                XCTAssert(!result.binContents.contains("bexec"))
+
+                // FIXME: We create the modulemap during build planning, hence this uglyness.
+                let bTargetBuildDir = ((try? localFileSystem.getDirectoryContents(result.binPath.appending(component: "BTarget1.build"))) ?? []).filter{ $0 != moduleMapFilename }
+                XCTAssertEqual(bTargetBuildDir, [])
+
+                XCTAssert(!result.binContents.contains("BTarget2.build"))
+                XCTAssert(!result.binContents.contains("cexec"))
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
                 XCTFail(stderr)
             }
         }
     }
 
-    static var allTests = [
-        ("testUsage", testUsage),
-        ("testVersion", testVersion),
-        ("testBinPath", testBinPath),
-        ("testBackwardsCompatibilitySymlink", testBackwardsCompatibilitySymlink),
-        ("testProductAndTarget", testProductAndTarget),
-        ("testNonReachableProductsAndTargetsFunctional", testNonReachableProductsAndTargetsFunctional),
-    ]
+    func testParseableInterfaces() {
+        fixture(name: "Miscellaneous/ParseableInterfaces") { path in
+            do {
+                let result = try build(["--enable-parseable-module-interfaces"], packagePath: path)
+                XCTAssert(result.binContents.contains("A.swiftinterface"))
+                XCTAssert(result.binContents.contains("B.swiftinterface"))
+            } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
+                XCTFail(stderr)
+            }
+        }
+    }
 }

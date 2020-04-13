@@ -8,272 +8,377 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
-import Utility
-import PackageDescription4
+import TSCBasic
+import TSCUtility
+import PackageModel
+import Foundation
 
-/// Load PackageDescription4 models from the given JSON. The JSON is expected to be completely valid.
-/// The base url is used to resolve any relative paths in the dependency declarations.
-func loadPackageDescription4(
-   _ json: JSON,
-   baseURL: String
-) throws -> PackageDescription4.Package {
-    // Construct objects from JSON.
-    let package = PackageDescription4.Package.fromJSON(json, baseURL: baseURL)
-    let errors = parseErrors(json)
-    guard errors.isEmpty else {
-        throw ManifestParseError.runtimeManifestErrors(errors)
+extension ManifestBuilder {
+    mutating func build(v4 json: JSON, toolsVersion: ToolsVersion) throws {
+        let package = try json.getJSON("package")
+        self.name = try package.get(String.self, forKey: "name")
+        self.defaultLocalization = try? package.get(String.self, forKey: "defaultLocalization")
+        self.pkgConfig = package.get("pkgConfig")
+        self.platforms = try parsePlatforms(package)
+        self.swiftLanguageVersions = try parseSwiftLanguageVersion(package)
+        self.products = try package.getArray("products").map(ProductDescription.init(v4:))
+        self.providers = try? package.getArray("providers").map(SystemPackageProviderDescription.init(v4:))
+        self.targets = try package.getArray("targets").map(parseTarget(json:))
+        self.dependencies = try package.getArray("dependencies").map({
+            try PackageDependencyDescription(
+                v4: $0,
+                toolsVersion: toolsVersion,
+                baseURL: self.baseURL,
+                fileSystem: self.fs
+            )
+        })
+
+        self.cxxLanguageStandard = package.get("cxxLanguageStandard")
+        self.cLanguageStandard = package.get("cLanguageStandard")
+
+        self.errors = try json.get("errors")
     }
-    return package
+
+    func parseSwiftLanguageVersion(_ package: JSON) throws -> [SwiftLanguageVersion]?  {
+        guard let versionJSON = try? package.getArray("swiftLanguageVersions") else {
+            return nil
+        }
+
+        return try versionJSON.map {
+            try SwiftLanguageVersion(string: String(json: $0))!
+        }
+    }
+
+    func parsePlatforms(_ package: JSON) throws -> [PlatformDescription] {
+        guard let platformsJSON = try? package.getJSON("platforms") else {
+            return []
+        }
+
+        // Get the declared platform list.
+        let declaredPlatforms = try platformsJSON.getArray()
+
+        // Empty list is not supported.
+        if declaredPlatforms.isEmpty {
+            throw ManifestParseError.runtimeManifestErrors(["supported platforms can't be empty"])
+        }
+
+        // Start parsing platforms.
+        var platforms: [PlatformDescription] = []
+
+        for platformJSON in declaredPlatforms {
+            // Parse the version and validate that it can be used in the current
+            // manifest version.
+            let versionString: String = try platformJSON.get("version")
+
+            // Get the platform name.
+            let platformName: String = try platformJSON.getJSON("platform").get("name")
+
+            let versionComponents = versionString.split(
+                separator: ".",
+                omittingEmptySubsequences: false
+            )
+            var version: [String.SubSequence] = []
+            var options: [String.SubSequence] = []
+
+            for (idx, component) in versionComponents.enumerated() {
+                if idx < 2 {
+                    version.append(component)
+                    continue
+                }
+
+                if idx == 2, UInt(component) != nil {
+                    version.append(component)
+                    continue
+                }
+
+                options.append(component)
+            }
+
+            let description = PlatformDescription(
+                name: platformName,
+                version: version.joined(separator: "."),
+                options: options.map{ String($0) }
+            )
+
+            // Check for duplicates.
+            if platforms.map({ $0.platformName }).contains(platformName) {
+                // FIXME: We need to emit the API name and not the internal platform name.
+                throw ManifestParseError.runtimeManifestErrors(["found multiple declaration for the platform: \(platformName)"])
+            }
+
+            platforms.append(description)
+        }
+
+        return platforms
+    }
+
+    private func parseTarget(json: JSON) throws -> TargetDescription {
+        let providers = try? json
+            .getArray("providers")
+            .map(SystemPackageProviderDescription.init(v4:))
+
+        let dependencies = try json
+            .getArray("dependencies")
+            .map(TargetDescription.Dependency.init(v4:))
+
+        let sources: [String]? = try? json.get("sources")
+        try sources?.forEach{ _ = try RelativePath(validating: $0) }
+
+        let exclude: [String] = try json.get("exclude")
+        try exclude.forEach{ _ = try RelativePath(validating: $0) }
+
+        return TargetDescription(
+            name: try json.get("name"),
+            dependencies: dependencies,
+            path: json.get("path"),
+            url: json.get("url"),
+            exclude: exclude,
+            sources: sources,
+            resources: try parseResources(json),
+            publicHeadersPath: json.get("publicHeadersPath"),
+            type: try .init(v4: json.get("type")),
+            pkgConfig: json.get("pkgConfig"),
+            providers: providers,
+            settings: try parseBuildSettings(json),
+            checksum: json.get("checksum")
+        )
+    }
+
+    func parseResources(_ json: JSON) throws -> [TargetDescription.Resource] {
+        guard let resourcesJSON = try? json.getArray("resources") else { return [] }
+        if resourcesJSON.isEmpty {
+            throw ManifestParseError.runtimeManifestErrors(["resources cannot be an empty array; provide at least one value or remove it"])
+        }
+
+        return try resourcesJSON.map { json in
+            let rawRule = try json.get(String.self, forKey: "rule")
+            let rule = TargetDescription.Resource.Rule(rawValue: rawRule)!
+            let path = try RelativePath(validating: json.get(String.self, forKey: "path"))
+            let localizationString = try? json.get(String.self, forKey: "localization")
+            let localization = localizationString.map({ TargetDescription.Resource.Localization(rawValue: $0)! })
+            return .init(rule: rule, path: path.pathString, localization: localization)
+        }
+    }
+
+    func parseBuildSettings(_ json: JSON) throws -> [TargetBuildSettingDescription.Setting] {
+        var settings: [TargetBuildSettingDescription.Setting] = []
+        for tool in TargetBuildSettingDescription.Tool.allCases {
+            let key = tool.rawValue + "Settings"
+            if let settingsJSON = try? json.getJSON(key) {
+                settings += try parseBuildSettings(settingsJSON, tool: tool, settingName: key)
+            }
+        }
+        return settings
+    }
+
+    func parseBuildSettings(_ json: JSON, tool: TargetBuildSettingDescription.Tool, settingName: String) throws -> [TargetBuildSettingDescription.Setting] {
+
+        let declaredSettings = try json.getArray()
+        if declaredSettings.isEmpty {
+            throw ManifestParseError.runtimeManifestErrors(["\(settingName) cannot be an empty array; provide at least one setting or remove it"])
+        }
+
+        return try declaredSettings.map({
+            try parseBuildSetting($0, tool: tool)
+        })
+    }
+
+    func parseBuildSetting(_ json: JSON, tool: TargetBuildSettingDescription.Tool) throws -> TargetBuildSettingDescription.Setting {
+        let json = try json.getJSON("data")
+        let name = try TargetBuildSettingDescription.SettingName(rawValue: json.get("name"))!
+        let condition = try (try? json.getJSON("condition")).flatMap(PackageConditionDescription.init(v4:))
+
+        let value = try json.get([String].self, forKey: "value")
+
+        // Diagnose invalid values.
+        for item in value {
+            let groups = Self.invalidValueRegex.matchGroups(in: item).flatMap{ $0 }
+            if !groups.isEmpty {
+                let error = "the build setting '\(name)' contains invalid component(s): \(groups.joined(separator: " "))"
+                throw ManifestParseError.runtimeManifestErrors([error])
+            }
+        }
+
+        return .init(
+            tool: tool, name: name,
+            value: value,
+            condition: condition
+        )
+    }
+
+    /// Looks for Xcode-style build setting macros "$()".
+    private static let invalidValueRegex = try! RegEx(pattern: #"(\$\(.*?\))"#)
 }
 
-// All of these methods are file private and are unit tested using manifest loader.
-extension PackageDescription4.Package {
-    fileprivate static func fromJSON(_ json: JSON, baseURL: String? = nil) -> PackageDescription4.Package {
-        // This is a private API, currently, so we do not currently try and
-        // validate the input.
-        guard case .dictionary(let topLevelDict) = json else { fatalError("unexpected item") }
-        guard case .dictionary(let package)? = topLevelDict["package"] else { fatalError("missing package") }
-
-        guard case .string(let name)? = package["name"] else { fatalError("missing 'name'") }
-
-        var pkgConfig: String? = nil
-        if case .string(let value)? = package["pkgConfig"] {
-            pkgConfig = value
+extension SystemPackageProviderDescription {
+    fileprivate init(v4 json: JSON) throws {
+        let name = try json.get(String.self, forKey: "name")
+        let value = try json.get([String].self, forKey: "values")
+        switch name {
+        case "brew":
+            self = .brew(value)
+        case "apt":
+            self = .apt(value)
+        default:
+            fatalError()
         }
+    }
+}
 
-        // Parse the targets.
-        var targets: [PackageDescription4.Target] = []
-        if case .array(let array)? = package["targets"] {
-            targets = array.map(PackageDescription4.Target.fromJSON)
-        }
+extension PackageModel.ProductType {
+    fileprivate init(v4 json: JSON) throws {
+        let productType = try json.get(String.self, forKey: "product_type")
 
-        // Parse the products.
-        var products: [PackageDescription4.Product] = []
-        if case .array(let array)? = package["products"] {
-            products = array.map(PackageDescription4.Product.fromJSON)
-        }
+        switch productType {
+        case "executable":
+            self = .executable
 
-        var providers: [PackageDescription4.SystemPackageProvider]? = nil
-        if case .array(let array)? = package["providers"] {
-            providers = array.map(PackageDescription4.SystemPackageProvider.fromJSON)
-        }
+        case "library":
+            let libraryType: ProductType.LibraryType
 
-        // Parse the dependencies.
-        var dependencies: [PackageDescription4.Package.Dependency] = []
-        if case .array(let array)? = package["dependencies"] {
-            dependencies = array.map({ PackageDescription4.Package.Dependency.fromJSON($0, baseURL: baseURL) })
-        }
-
-        // Parse the compatible swift versions.
-        var swiftLanguageVersions: [Int]? = nil
-        if case .array(let array)? = package["swiftLanguageVersions"] {
-            swiftLanguageVersions = array.map({
-                guard case .int(let value) = $0 else { fatalError("swiftLanguageVersions contains non int element") }
-                return value
-            })
-        }
-
-        // Parse the C and C++ language standard.
-        let cLanguageStandard: CLanguageStandard? = package["cLanguageStandard"].flatMap {
-            switch $0 {
-            case .string(let rawValue):
-                return CLanguageStandard(rawValue: rawValue)!
-            case .null:
-                return nil
+            let libraryTypeString: String? = json.get("type")
+            switch libraryTypeString {
+            case "static"?:
+                libraryType = .static
+            case "dynamic"?:
+                libraryType = .dynamic
+            case nil:
+                libraryType = .automatic
             default:
                 fatalError()
             }
-        }
-        let cxxLanguageStandard: CXXLanguageStandard? = package["cxxLanguageStandard"].flatMap {
-            switch $0 {
-            case .string(let rawValue):
-                return CXXLanguageStandard(rawValue: rawValue)!
-            case .null:
-                return nil
-            default:
-                fatalError()
-            }
-        }
 
-        return PackageDescription4.Package(
-            name: name,
-            pkgConfig: pkgConfig,
-            providers: providers,
-            products: products,
-            dependencies: dependencies,
-            targets: targets,
-            swiftLanguageVersions: swiftLanguageVersions,
-            cLanguageStandard: cLanguageStandard,
-            cxxLanguageStandard: cxxLanguageStandard
+            self = .library(libraryType)
+
+        default:
+            fatalError("unexpected product type: \(json)")
+        }
+    }
+}
+
+extension ProductDescription {
+    fileprivate init(v4 json: JSON) throws {
+        try self.init(
+            name: json.get("name"),
+            type: .init(v4: json),
+            targets: json.get("targets")
         )
     }
 }
 
-extension PackageDescription4.Package.Dependency {
-    fileprivate static func fromJSON(_ json: JSON, baseURL: String?) -> PackageDescription4.Package.Dependency {
-        guard case .dictionary(let dict) = json else { fatalError("Unexpected item") }
-        guard case .string(let url)? = dict["url"],
-              case .dictionary(let requirementDict)? = dict["requirement"] else {
-            fatalError("Unexpected item")
+extension PackageDependencyDescription.Requirement {
+    fileprivate init(v4 json: JSON) throws {
+        let type = try json.get(String.self, forKey: "type")
+        switch type {
+        case "branch":
+            self = try .branch(json.get("identifier"))
+
+        case "revision":
+            self = try .revision(json.get("identifier"))
+
+        case "range":
+            let lowerBound = try json.get(String.self, forKey: "lowerBound")
+            let upperBound = try json.get(String.self, forKey: "upperBound")
+            self = .range(Version(string: lowerBound)! ..< Version(string: upperBound)!)
+
+        case "exact":
+            let identifier = try json.get(String.self, forKey: "identifier")
+            self = .exact(Version(string: identifier)!)
+
+        case "localPackage":
+            self = .localPackage
+
+        default:
+            fatalError()
         }
+    }
+}
 
-        let requirement: Package.Dependency.Requirement
+extension PackageDependencyDescription {
+    fileprivate init(v4 json: JSON, toolsVersion: ToolsVersion, baseURL: String, fileSystem: FileSystem) throws {
+        let isBaseURLRemote = URL.scheme(baseURL) != nil
 
-        switch requirementDict["type"] {
-        case .string("branch")?:
-            guard case .string(let identifier)? = requirementDict["identifier"] else { fatalError() }
-            requirement = .branchItem(identifier)
-
-        case .string("revision")?:
-            guard case .string(let identifier)? = requirementDict["identifier"] else { fatalError() }
-            requirement = .revisionItem(identifier)
-
-        case .string("range")?:
-            guard case .string(let vv1)? = requirementDict["lowerBound"],
-                  case .string(let vv2)? = requirementDict["upperBound"],
-                  let v1 = Version(vv1), let v2 = Version(vv2) else {
-                fatalError()
-            }
-            requirement = .rangeItem(v1..<v2)
-
-        case .string("exact")?:
-            guard case .string(let identifier)? = requirementDict["identifier"] else { fatalError() }
-            requirement = .exactItem(Version(identifier)!)
-
-        default: fatalError()
-        }
-
-        func fixURL() -> String {
-            if let baseURL = baseURL, URL.scheme(url) == nil {
-                // If the URL has no scheme, we treat it as a path (either absolute or relative to the base URL).
-                return AbsolutePath(url, relativeTo: AbsolutePath(baseURL)).asString
-            } else {
+        func fixURL(_ url: String, requirement: Requirement) throws -> String {
+            // If base URL is remote (http/ssh), we can't do any "fixing".
+            if isBaseURLRemote {
                 return url
             }
+
+            // If the dependency URL starts with '~/', try to expand it.
+            if url.hasPrefix("~/") {
+                return fileSystem.homeDirectory.appending(RelativePath(String(url.dropFirst(2)))).pathString
+            }
+
+            // If the dependency URL is not remote, try to "fix" it.
+            if URL.scheme(url) == nil {
+                // If the URL has no scheme, we treat it as a path (either absolute or relative to the base URL).
+                return AbsolutePath(url, relativeTo: AbsolutePath(baseURL)).pathString
+            }
+
+            if case .localPackage = requirement {
+                do {
+                    return try AbsolutePath(validating: url).pathString
+                } catch PathValidationError.invalidAbsolutePath(let path) {
+                    throw ManifestParseError.invalidManifestFormat("'\(path)' is not a valid path for path-based dependencies; use relative or absolute path instead.", diagnosticFile: nil)
+                }
+            }
+
+            return url
         }
 
-        return PackageDescription4.Package.Dependency.package(url: fixURL(), requirement)
+        let requirement = try Requirement(v4: json.get("requirement"))
+        let url = try fixURL(json.get("url"), requirement: requirement)
+        let name: String? = json.get("name")
+        self.init(name: name, url: url, requirement: requirement)
     }
 }
 
-extension PackageDescription4.SystemPackageProvider {
-    fileprivate static func fromJSON(_ json: JSON) -> PackageDescription4.SystemPackageProvider {
-        let values: [String] = try! json.get("values")
-        let name: String = try! json.get("name")
-        switch name {
-        case "brew":
-            return .brewItem(values)
-        case "apt":
-            return .aptItem(values)
+extension TargetDescription.TargetType {
+    fileprivate init(v4 string: String) throws {
+        switch string {
+        case "regular":
+            self = .regular
+        case "test":
+            self = .test
+        case "system":
+            self = .system
+        case "binary":
+            self = .binary
         default:
-            fatalError("unexpected string")
+            fatalError()
         }
     }
 }
 
-extension PackageDescription4.Target {
-    fileprivate static func fromJSON(_ json: JSON) -> PackageDescription4.Target {
-        guard case .dictionary(let dict) = json else { fatalError("unexpected item") }
-        var dependencies: [PackageDescription4.Target.Dependency] = []
-        if case .array(let array)? = dict["dependencies"] {
-            dependencies = array.map(PackageDescription4.Target.Dependency.fromJSON)
-        }
+extension TargetDescription.Dependency {
+    fileprivate init(v4 json: JSON) throws {
+        let type = try json.get(String.self, forKey: "type")
+        let condition = try (try? json.getJSON("condition")).flatMap(PackageConditionDescription.init(v4:))
 
-        let name: String = try! json.get("name")
-        let isTest: Bool = try! json.get("isTest")
-        let publicHeadersPath: String? = json.get("publicHeadersPath")
-
-        let path: String? = json.get("path")
-        let exclude: [String] = try! json.get("exclude")
-
-        let sourcesJSON: JSON = try! json.get("sources")
-        var sources: [String]? = nil
-        if case JSON.array(let sourcesData) = sourcesJSON {
-            sources = try! sourcesData.map(String.init)
-        }
-
-        if isTest {
-            return PackageDescription4.Target.testTarget(
-                name: name,
-                dependencies: dependencies,
-                path: path,
-                exclude: exclude,
-                sources: sources)
-        }
-        return PackageDescription4.Target.target(
-            name: name,
-            dependencies: dependencies,
-            path: path,
-            exclude: exclude,
-            sources: sources,
-            publicHeadersPath: publicHeadersPath)
-    }
-}
-
-extension PackageDescription4.Target.Dependency {
-    fileprivate static func fromJSON(_ item: JSON) -> PackageDescription4.Target.Dependency {
-        guard case .dictionary(let dict) = item else { fatalError("unexpected item") }
-        guard case .string(let type)? = dict["type"] else { fatalError("unexpected item") }
         switch type {
         case "target":
-            guard case .string(let name)? = dict["name"] else { fatalError("unexpected item") }
-            return .targetItem(name: name)
+            self = try .target(name: json.get("name"), condition: condition)
+
         case "product":
-            guard case .string(let name)? = dict["name"] else { fatalError("unexpected item") }
-            guard let package = dict["package"] else { fatalError("unexpected item") }
-            let pkg: String?
-            switch package {
-            case .string(let str): pkg = str
-            case .null: pkg = nil
-            default: fatalError("unexpected item")
-            }
-            return .productItem(name: name, package: pkg)
+            let name = try json.get(String.self, forKey: "name")
+            self = .product(name: name, package: json.get("package"), condition: condition)
+
         case "byname":
-            guard case .string(let name)? = dict["name"] else { fatalError("unexpected item") }
-            return .byNameItem(name: name)
-        default: fatalError("unexpected item")
-        }
-    }
-}
+            self = try .byName(name: json.get("name"), condition: condition)
 
-extension PackageDescription4.Product {
-    fileprivate static func fromJSON(_ json: JSON) -> PackageDescription4.Product {
-        let productType: String = try! json.get("product_type")
-
-        switch productType {
-        case "executable":
-            return try! .executable(
-                name: json.get("name"),
-                targets: json.get("targets")
-            )
-        case "library":
-            let type: PackageDescription4.Product.Library.LibraryType?
-            let typeString: String? = json.get("type")
-            switch typeString {
-            case "static"?:
-                type = .static
-            case "dynamic"?:
-                type = .dynamic
-            default:
-                type = nil
-            }
-            return try! .library(
-                name: json.get("name"),
-                type: type,
-                targets: json.get("targets")
-            )
         default:
-            fatalError("unexpected item")
+            fatalError()
         }
     }
 }
 
-fileprivate func parseErrors(_ json: JSON) -> [String] {
-    guard case .dictionary(let topLevelDict) = json else { fatalError("unexpected item") }
-    guard case .array(let errors)? = topLevelDict["errors"] else { fatalError("missing errors") }
-    return errors.map({ error in
-        guard case .string(let string) = error else { fatalError("unexpected item") }
-        return string
-    })
+extension PackageConditionDescription {
+    fileprivate init?(v4 json: JSON) throws {
+        if case .null = json { return nil }
+        let platformNames: [String]? = try? json.getArray("platforms").map { try $0.get("name") }
+        self.init(
+            platformNames: platformNames ?? [],
+            config: try? json.get("config").get("config")
+        )
+    }
 }

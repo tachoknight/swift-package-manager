@@ -8,21 +8,25 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
-import Utility
+import TSCBasic
+import TSCUtility
 
 /// A grouping of related source files.
 public struct Sources {
-    public let relativePaths: [RelativePath]
+    /// The root of the sources.
     public let root: AbsolutePath
 
+    /// The subpaths within the root.
+    public var relativePaths: [RelativePath]
+
+    /// The list of absolute paths of all files.
     public var paths: [AbsolutePath] {
         return relativePaths.map({ root.appending($0) })
     }
 
     public init(paths: [AbsolutePath], root: AbsolutePath) {
         let relativePaths = paths.map({ $0.relative(to: root) })
-        self.relativePaths = relativePaths.sorted(by: { $0.asString < $1.asString })
+        self.relativePaths = relativePaths.sorted(by: { $0.pathString < $1.pathString })
         self.root = root
     }
 
@@ -33,6 +37,16 @@ public struct Sources {
                 return false
             }
             return SupportedLanguageExtension.cppExtensions.contains(ext)
+        })
+    }
+
+    /// Returns true if the sources contain C++ files.
+    public var containsObjcFiles: Bool {
+        return paths.contains(where: {
+            guard let ext = $0.extension else {
+                return false
+            }
+            return ext == SupportedLanguageExtension.m.rawValue
         })
     }
 }
@@ -51,6 +65,9 @@ public enum SupportedLanguageExtension: String {
     case cc
     case cpp
     case cxx
+    /// Assembly
+    case s
+    case S
 
     /// Returns a set of valid swift extensions.
     public static var swiftExtensions: Set<String> = {
@@ -67,15 +84,24 @@ public enum SupportedLanguageExtension: String {
         SupportedLanguageExtension.stringSet(mm, cc, cpp, cxx)
     }()
 
-    /// Returns a set of valid c family extensions.
-    public static var cFamilyExtensions: Set<String> = {
-        cExtensions.union(cppExtensions)
+    /// Returns a set of valid assembly file extensions.
+    public static var assemblyExtensions: Set<String> = {
+        SupportedLanguageExtension.stringSet(.s, .S)
     }()
 
+    /// Returns a set of valid extensions in clang targets.
+    public static func clangTargetExtensions(toolsVersion: ToolsVersion) -> Set<String> {
+        var validExts = cExtensions.union(cppExtensions)
+        if toolsVersion >= .v5 {
+            validExts.formUnion(assemblyExtensions)
+        }
+        return validExts
+    }
+
     /// Returns a set of all file extensions we support.
-    public static var validExtensions: Set<String> = {
-        swiftExtensions.union(cFamilyExtensions)
-    }()
+    public static func validExtensions(toolsVersion: ToolsVersion) -> Set<String> {
+        return swiftExtensions.union(clangTargetExtensions(toolsVersion: toolsVersion))
+    }
 
     /// Converts array of LanguageExtension into a string set representation.
     ///

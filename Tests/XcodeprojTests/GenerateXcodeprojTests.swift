@@ -8,27 +8,47 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
-import TestSupport
-import PackageDescription
+import TSCBasic
+import SPMTestSupport
 import PackageGraph
 import PackageModel
-@testable import Xcodeproj
-import Utility
+import SourceControl
+import Xcodeproj
+import TSCUtility
 import XCTest
 
 class GenerateXcodeprojTests: XCTestCase {
+    func testBuildXcodeprojPath() {
+        let outdir = AbsolutePath("/path/to/project")
+        let projectName = "Bar"
+        let xcodeprojPath = Xcodeproj.buildXcodeprojPath(outputDir: outdir, projectName: projectName)
+        let expectedPath = AbsolutePath("/path/to/project/Bar.xcodeproj")
+        XCTAssertEqual(xcodeprojPath, expectedPath)
+    }
+
     func testXcodebuildCanParseIt() {
       #if os(macOS)
         mktmpdir { dstdir in
             let fileSystem = InMemoryFileSystem(emptyFiles: "/Sources/DummyModuleName/source.swift")
 
             let diagnostics = DiagnosticsEngine()
-            let graph = loadMockPackageGraph(["/": Package(name: "Foo")], root: "/", diagnostics: diagnostics, in: fileSystem)
-            XCTAssertFalse(diagnostics.hasErrors)
+            let graph = loadPackageGraph(fs: fileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: "/",
+                        url: "/foo",
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModuleName"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
 
             let projectName = "DummyProjectName"
-            let outpath = try Xcodeproj.generate(outputDir: dstdir, projectName: projectName, graph: graph, options: XcodeprojOptions())
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
 
             XCTAssertDirectoryExists(outpath)
             XCTAssertEqual(outpath, dstdir.appending(component: projectName + ".xcodeproj"))
@@ -36,38 +56,47 @@ class GenerateXcodeprojTests: XCTestCase {
             // We can only validate this on OS X.
             // Don't allow TOOLCHAINS to be overriden here, as it breaks the test below.
             let output = try Process.checkNonZeroExit(
-                args: "env", "-u", "TOOLCHAINS", "xcodebuild", "-list", "-project", outpath.asString).chomp()
+                args: "env", "-u", "TOOLCHAINS", "xcodebuild", "-list", "-project", outpath.pathString).spm_chomp()
 
-            XCTAssertTrue(output.hasPrefix("""
+            XCTAssertTrue(output.contains("""
                Information about project "DummyProjectName":
                    Targets:
                        DummyModuleName
-                       Foo
-                       FooPackageDescription
 
                    Build Configurations:
                        Debug
                        Release
-               
-                   If no build configuration is specified and -scheme is not passed then "Debug" is used.
-               
+
+                   If no build configuration is specified and -scheme is not passed then "Release" is used.
+
                    Schemes:
-                       DummyProjectName-Package
-               """))
+                       Foo-Package
+               """), output)
         }
       #endif
     }
 
     func testXcconfigOverrideValidatesPath() throws {
+        let fileSystem = InMemoryFileSystem(emptyFiles: "/Bar/Sources/Bar/bar.swift")
         let diagnostics = DiagnosticsEngine()
-        let fileSystem = InMemoryFileSystem(emptyFiles: "/Bar/bar.swift")
-        let graph = loadMockPackageGraph(["/Bar": Package(name: "Bar")], root: "/Bar", diagnostics: diagnostics, in: fileSystem)
-        XCTAssertFalse(diagnostics.hasErrors)
+        let graph = loadPackageGraph(fs: fileSystem, diagnostics: diagnostics,
+            manifests: [
+                Manifest.createV4Manifest(
+                    name: "Bar",
+                    path: "/Bar",
+                    url: "/Bar",
+                    packageKind: .root,
+                    targets: [
+                        TargetDescription(name: "Bar"),
+                    ])
+            ]
+        )
+        XCTAssertNoDiagnostics(diagnostics)
 
         let options = XcodeprojOptions(xcconfigOverrides: AbsolutePath("/doesntexist"))
         do {
             _ = try xcodeProject(xcodeprojPath: AbsolutePath.root.appending(component: "xcodeproj"),
-                                 graph: graph, extraDirs: [], options: options, fileSystem: fileSystem)
+                                 graph: graph, extraDirs: [], extraFiles: [], options: options, fileSystem: fileSystem, diagnostics: diagnostics)
             XCTFail("Project generation should have failed")
         } catch ProjectGenerationError.xcconfigOverrideNotFound(let path) {
             XCTAssertEqual(options.xcconfigOverrides, path)
@@ -77,24 +106,287 @@ class GenerateXcodeprojTests: XCTestCase {
     }
 
     func testGenerateXcodeprojWithInvalidModuleNames() throws {
-        let diagnostics = DiagnosticsEngine()
-        let moduleName = "Modules"
         let warningStream = BufferedOutputByteStream()
-        let fileSystem = InMemoryFileSystem(emptyFiles: "/Sources/\(moduleName)/example.swift")
-        let graph = loadMockPackageGraph(["/Sources": Package(name: moduleName)], root: "/Sources", diagnostics: diagnostics, in: fileSystem)
-        XCTAssertFalse(diagnostics.hasErrors)
+        let fileSystem = InMemoryFileSystem(
+            emptyFiles: "/Bar/Sources/Modules/example.swift"
+        )
 
-        _ = try xcodeProject(xcodeprojPath: AbsolutePath.root.appending(component: "xcodeproj"),
-                             graph: graph, extraDirs: [], options: XcodeprojOptions(), fileSystem: fileSystem,
-                             warningStream: warningStream)
+        let diagnostics = DiagnosticsEngine()
+        let graph = loadPackageGraph(fs: fileSystem, diagnostics: diagnostics,
+            manifests: [
+                Manifest.createV4Manifest(
+                    name: "Modules",
+                    path: "/Bar",
+                    url: "/Bar",
+                    packageKind: .root,
+                    targets: [
+                        TargetDescription(name: "Modules"),
+                    ])
+            ]
+        )
+        XCTAssertNoDiagnostics(diagnostics)
 
-        let warnings = warningStream.bytes.asReadableString
-        XCTAssertTrue(warnings.contains("warning: Target '\(moduleName)' conflicts with required framework filenames, rename this target to avoid conflicts."))
+        _ = try xcodeProject(
+            xcodeprojPath: AbsolutePath.root.appending(component: "xcodeproj"),
+            graph: graph, extraDirs: [], extraFiles: [],
+            options: XcodeprojOptions(), fileSystem: fileSystem,
+            diagnostics: diagnostics, warningStream: warningStream)
+
+        let warnings = warningStream.bytes.description
+        XCTAssertMatch(warnings, .contains("warning: Target 'Modules' conflicts with required framework filenames, rename this target to avoid conflicts."))
     }
 
-    static var allTests = [
-        ("testXcodebuildCanParseIt", testXcodebuildCanParseIt),
-        ("testXcconfigOverrideValidatesPath", testXcconfigOverrideValidatesPath),
-        ("testGenerateXcodeprojWithInvalidModuleNames", testGenerateXcodeprojWithInvalidModuleNames),
-    ]
+    func testGenerateXcodeprojWithoutGitRepo() {
+        mktmpdir { dstdir in
+
+            let packagePath = dstdir.appending(component: "Foo")
+            let modulePath = packagePath.appending(components: "Sources", "DummyModule")
+            try makeDirectories(modulePath)
+            try localFileSystem.writeFileContents(modulePath.appending(component: "dummy.swift"), bytes: "dummy_data")
+            try localFileSystem.writeFileContents(packagePath.appending(component: "a.txt"), bytes: "dummy_data")
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(
+                fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: packagePath.pathString,
+                        url: packagePath.pathString,
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModule"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
+
+            let projectName = "DummyProjectName"
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            let project = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
+
+            XCTAssertFalse(project.mainGroup.subitems.contains { $0.path == "a.txt" })
+        }
+    }
+
+    func testGenerateXcodeprojWithDotFiles() {
+        mktmpdir { dstdir in
+
+            let packagePath = dstdir.appending(component: "Foo")
+            let modulePath = packagePath.appending(components: "Sources", "DummyModule")
+            try makeDirectories(modulePath)
+            try localFileSystem.writeFileContents(modulePath.appending(component: "dummy.swift"), bytes: "dummy_data")
+            try localFileSystem.writeFileContents(packagePath.appending(component: ".a.txt"), bytes: "dummy_data")
+
+            initGitRepo(packagePath, addFile: false)
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(
+                fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: packagePath.pathString,
+                        url: packagePath.pathString,
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModule"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
+
+            let projectName = "DummyProjectName"
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            let project = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
+
+            XCTAssertFalse(project.mainGroup.subitems.contains { $0.path == ".a.txt" })
+        }
+    }
+
+    func testGenerateXcodeprojWithRootFiles() {
+        mktmpdir { dstdir in
+
+            let packagePath = dstdir.appending(component: "Foo")
+            let modulePath = packagePath.appending(components: "Sources", "DummyModule")
+            try makeDirectories(modulePath)
+            try localFileSystem.writeFileContents(modulePath.appending(component: "dummy.swift"), bytes: "dummy_data")
+            try localFileSystem.writeFileContents(packagePath.appending(component: "a.txt"), bytes: "dummy_data")
+
+            initGitRepo(packagePath, addFile: false)
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(
+                fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: packagePath.pathString,
+                        url: packagePath.pathString,
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModule"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
+
+            let projectName = "DummyProjectName"
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            let project = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
+
+            XCTAssertTrue(project.mainGroup.subitems.contains { $0.path == "a.txt" })
+
+            let projectWithoutExtraFiles = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(addExtraFiles: false), diagnostics: diagnostics)
+            XCTAssertFalse(projectWithoutExtraFiles.mainGroup.subitems.contains { $0.path == "a.txt" })
+        }
+    }
+
+    func testGenerateXcodeprojWithNonSourceFilesInSourceDirectories() {
+        mktmpdir { dstdir in
+
+            let packagePath = dstdir.appending(component: "Foo")
+            let modulePath = packagePath.appending(components: "Sources", "DummyModule")
+            try makeDirectories(modulePath)
+            try localFileSystem.writeFileContents(modulePath.appending(component: "dummy.swift"), bytes: "dummy_data")
+            try localFileSystem.writeFileContents(modulePath.appending(component: "a.txt"), bytes: "dummy_data")
+
+            initGitRepo(packagePath, addFile: false)
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(
+                fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: packagePath.pathString,
+                        url: packagePath.pathString,
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModule"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
+
+            let projectName = "DummyProjectName"
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            let project = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
+
+            let sources = project.mainGroup.subitems[1] as? Xcode.Group
+            let dummyModule = sources?.subitems[0] as? Xcode.Group
+            let aTxt = dummyModule?.subitems[0]
+
+            XCTAssertEqual(aTxt?.path, "a.txt")
+        }
+    }
+
+    func testGenerateXcodeprojWithFilesIgnoredByGit() {
+        mktmpdir { dstdir in
+
+            let packagePath = dstdir.appending(component: "Foo")
+            let modulePath = packagePath.appending(components: "Sources", "DummyModule")
+
+            try makeDirectories(modulePath)
+            try localFileSystem.writeFileContents(modulePath.appending(component: "dummy.swift"), bytes: "dummy_data")
+
+            initGitRepo(packagePath, addFile: false)
+            // Add a .gitignore
+            try localFileSystem.writeFileContents(packagePath.appending(component: ".gitignore"), bytes: "ignored_file")
+            try localFileSystem.writeFileContents(modulePath.appending(component: "ignored_file"), bytes: "dummy_data")
+            try localFileSystem.writeFileContents(packagePath.appending(component: "ignored_file"), bytes: "dummy_data")
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(
+                fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: packagePath.pathString,
+                        url: packagePath.pathString,
+                        packageKind: .root,
+                        targets: [
+                            TargetDescription(name: "DummyModule"),
+                        ])
+                ]
+            )
+            XCTAssertNoDiagnostics(diagnostics)
+
+            let projectName = "DummyProjectName"
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: projectName)
+            let project = try Xcodeproj.generate(projectName: projectName, xcodeprojPath: outpath, graph: graph, options: XcodeprojOptions(), diagnostics: diagnostics)
+
+            let sources = project.mainGroup.subitems[1] as? Xcode.Group
+            let dummyModule = sources?.subitems[0] as? Xcode.Group
+
+            XCTAssertEqual(dummyModule?.subitems.count, 1)
+            XCTAssertFalse(project.mainGroup.subitems.contains { $0.path == "ignored_file" })
+        }
+    }
+
+    func testGenerateXcodeprojWarnsConditionalTargetDependencies() {
+        mktmpdir { dstdir in
+            let fooPackagePath = dstdir.appending(component: "Foo")
+            let fooTargetPath = fooPackagePath.appending(components: "Sources", "Foo")
+            try makeDirectories(fooTargetPath)
+            try localFileSystem.writeFileContents(fooTargetPath.appending(component: "Sources.swift"), bytes: "")
+
+            let barPackagePath = dstdir.appending(component: "Bar")
+            let bar1TargetPath = barPackagePath.appending(components: "Sources", "Bar1")
+            try makeDirectories(bar1TargetPath)
+            try localFileSystem.writeFileContents(bar1TargetPath.appending(component: "Sources.swift"), bytes: "")
+            let bar2TargetPath = barPackagePath.appending(components: "Sources", "Bar2")
+            try makeDirectories(bar2TargetPath)
+            try localFileSystem.writeFileContents(bar2TargetPath.appending(component: "Sources.swift"), bytes: "")
+
+            let diagnostics = DiagnosticsEngine()
+            let graph = loadPackageGraph(fs: localFileSystem, diagnostics: diagnostics,
+                manifests: [
+                    Manifest.createV4Manifest(
+                        name: "Foo",
+                        path: fooPackagePath.pathString,
+                        url: fooPackagePath.pathString,
+                        dependencies: [
+                            PackageDependencyDescription(name: "Bar", url: barPackagePath.pathString, requirement: .localPackage)
+                        ],
+                        targets: [
+                            TargetDescription(name: "Foo", dependencies: [
+                                .product(name: "Bar", package: "Bar", condition: .init(platformNames: ["ios"]))
+                            ]),
+                        ]),
+                    Manifest.createV4Manifest(
+                        name: "Bar",
+                        path: barPackagePath.pathString,
+                        url: barPackagePath.pathString,
+                        packageKind: .remote,
+                        products: [
+                            ProductDescription(name: "Bar", targets: ["Bar1"])
+                        ],
+                        targets: [
+                            TargetDescription(name: "Bar1", dependencies: [
+                                .target(name: "Bar2", condition: .init(config: "debug"))
+                            ]),
+                            TargetDescription(name: "Bar2"),
+                        ])
+                ]
+            )
+
+            let outpath = Xcodeproj.buildXcodeprojPath(outputDir: dstdir, projectName: "Foo")
+            try Xcodeproj.generate(
+                projectName: "Foo",
+                xcodeprojPath: outpath,
+                graph: graph,
+                options: XcodeprojOptions(),
+                diagnostics: diagnostics)
+
+            DiagnosticsEngineTester(diagnostics) { result in
+                result.check(
+                    diagnostic: .regex("""
+                        Xcode project generation does not support conditional target dependencies, so the generated \
+                        project might not build successfully. The offending targets are: (Foo, Bar1|Bar1, Foo).
+                        """),
+                    behavior: .warning)
+            }
+        }
+    }
 }

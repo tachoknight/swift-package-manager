@@ -8,42 +8,28 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-@testable import PackageLoading
+import PackageLoading
 import XCTest
 
 final class PkgConfigWhitelistTests: XCTestCase {
     func testSimpleFlags() {
         let cFlags = ["-I/usr/local/Cellar/gtk+3/3.18.9/include/gtk-3.0"]
-        let libs = ["-L/usr/local/Cellar/gtk+3/3.18.9/lib", "-lgtk-3"]
-        do {
-            try whitelist(pcFile: "dummy", flags: (cFlags, libs))
-        } catch {
-            XCTFail("Unexpected failure \(error)")
-        }
+        let libs = ["-L/usr/local/Cellar/gtk+3/3.18.9/lib", "-lgtk-3", "-w"]
+        XCTAssertTrue(whitelist(pcFile: "dummy", flags: (cFlags, libs)).unallowed.isEmpty)
     }
 
     func testFlagsWithInvalidFlags() {
         let cFlags = ["-I/usr/local/Cellar/gtk+3/3.18.9/include/gtk-3.0", "-L/hello"]
-        let libs = ["-L/usr/local/Cellar/gtk+3/3.18.9/lib", "-lgtk-3", "-module-name", "name"]
-        do {
-            try whitelist(pcFile: "dummy", flags: (cFlags, libs))
-        } catch {
-            XCTAssertEqual("\(error)", """
-                nonWhitelistedFlags("Non whitelisted flags found: [\\"-L/hello\\", \\"-module-name\\", \\"name\\"] in pc file dummy")
-                """)
-        }
+        let libs = ["-L/usr/local/Cellar/gtk+3/3.18.9/lib", "-lgtk-3", "-module-name", "name", "-werror"]
+        let unallowed = whitelist(pcFile: "dummy", flags: (cFlags, libs)).unallowed
+        XCTAssertEqual(unallowed, ["-L/hello", "-module-name", "name", "-werror"])
     }
 
     func testFlagsWithValueInNextFlag() {
         let cFlags = ["-I/usr/local", "-I", "/usr/local/Cellar/gtk+3/3.18.9/include/gtk-3.0", "-L/hello"]
         let libs = ["-L", "/usr/lib", "-L/usr/local/Cellar/gtk+3/3.18.9/lib", "-lgtk-3", "-module-name", "-lcool", "ok", "name"]
-        do {
-            try whitelist(pcFile: "dummy", flags: (cFlags, libs))
-        } catch {
-            XCTAssertEqual("\(error)", """
-                nonWhitelistedFlags("Non whitelisted flags found: [\\"-L/hello\\", \\"-module-name\\", \\"ok\\", \\"name\\"] in pc file dummy")
-                """)
-        }
+        let unallowed = whitelist(pcFile: "dummy", flags: (cFlags, libs)).unallowed
+        XCTAssertEqual(unallowed, ["-L/hello", "-module-name", "ok", "name"])
     }
 
     func testRemoveDefaultFlags() {
@@ -54,11 +40,4 @@ final class PkgConfigWhitelistTests: XCTestCase {
         XCTAssertEqual(result.0, ["-I", "/usr/include/Cellar/gtk+3/3.18.9/include/gtk-3.0", "-L/hello"])
         XCTAssertEqual(result.1, ["-L/usr/lib/Cellar/gtk+3/3.18.9/lib", "-lgtk-3", "-module-name", "-lcool", "ok", "name"])
     }
-
-    static var allTests = [
-        ("testSimpleFlags", testSimpleFlags),
-        ("testFlagsWithInvalidFlags", testFlagsWithInvalidFlags),
-        ("testFlagsWithValueInNextFlag", testFlagsWithValueInNextFlag),
-        ("testRemoveDefaultFlags", testRemoveDefaultFlags),
-    ]
 }

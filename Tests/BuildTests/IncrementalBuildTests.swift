@@ -1,19 +1,18 @@
 /*
  This source file is part of the Swift.org open source project
- 
+
  Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
  Licensed under Apache License v2.0 with Runtime Library Exception
- 
+
  See http://swift.org/LICENSE.txt for license information
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
 import XCTest
 
-import TestSupport
-import Basic
-import Utility
-import func libc.sleep
+import SPMTestSupport
+import TSCBasic
+import TSCUtility
 
 
 /// Functional tests of incremental builds.  These are fairly ad hoc at this
@@ -38,17 +37,17 @@ import func libc.sleep
 final class IncrementalBuildTests: XCTestCase {
 
     func testIncrementalSingleModuleCLibraryInSources() {
-        fixture(name: "ClangModules/CLibrarySources") { prefix in
+        fixture(name: "CFamilyTargets/CLibrarySources") { prefix in
             // Build it once and capture the log (this will be a full build).
-            let fullLog = try executeSwiftBuild(prefix, printIfError: true)
-            
+            let (fullLog, _) = try executeSwiftBuild(prefix)
+
             // Check various things that we expect to see in the full build log.
             // FIXME:  This is specific to the format of the log output, which
             // is quite unfortunate but not easily avoidable at the moment.
-            XCTAssertTrue(fullLog.contains("Compile CLibrarySources Foo.c"))
+            XCTAssertTrue(fullLog.contains("Compiling CLibrarySources Foo.c"))
 
             let llbuildManifest = prefix.appending(components: ".build", "debug.yaml")
-            
+
             // Modify the source file in a way that changes its size so that the low-level
             // build system can detect the change. The timestamp change might be too less
             // for it to detect.
@@ -59,18 +58,18 @@ final class IncrementalBuildTests: XCTestCase {
 
             // Read the first llbuild manifest.
             let llbuildContents1 = try localFileSystem.readFileContents(llbuildManifest)
-            
+
             // Now build again.  This should be an incremental build.
-            let log2 = try executeSwiftBuild(prefix, printIfError: true)
-            XCTAssertTrue(log2.contains("Compile CLibrarySources Foo.c"))
+            let (log2, _) = try executeSwiftBuild(prefix)
+            XCTAssertTrue(log2.contains("Compiling CLibrarySources Foo.c"))
 
             // Read the second llbuild manifest.
             let llbuildContents2 = try localFileSystem.readFileContents(llbuildManifest)
-            
+
             // Now build again without changing anything.  This should be a null
             // build.
-            let log3 = try executeSwiftBuild(prefix, printIfError: true)
-            XCTAssertFalse(log3.contains("Compile CLibrarySources Foo.c"))
+            let (log3, _) = try executeSwiftBuild(prefix)
+            XCTAssertFalse(log3.contains("Compiling CLibrarySources Foo.c"))
 
             // Read the third llbuild manifest.
             let llbuildContents3 = try localFileSystem.readFileContents(llbuildManifest)
@@ -79,11 +78,33 @@ final class IncrementalBuildTests: XCTestCase {
             XCTAssertEqual(llbuildContents2, llbuildContents3)
         }
     }
-    
-    // FIXME:  We should add a lot more test cases here; the one above is just
-    // a starter test.
-    
-    static var allTests = [
-        ("testIncrementalSingleModuleCLibraryInSources", testIncrementalSingleModuleCLibraryInSources),
-    ]
+
+    func testBuildManifestCaching() {
+        fixture(name: "ValidLayouts/SingleModule/Library") { prefix in
+            @discardableResult
+            func build() throws -> String {
+                return try executeSwiftBuild(prefix, extraArgs: ["--enable-build-manifest-caching"]).stdout
+            }
+
+            // Perform a full build.
+            try build()
+            // Ensure manifest caching kicks in.
+            try build()
+
+            // Check that we're not re-planning when nothing has changed.
+            let log1 = try build()
+            XCTAssertFalse(log1.contains("PackageStructure") || log1.contains("Planning build"), log1)
+
+            // Check that we do run planning when a new source file is added.
+            let sourceFile = prefix.appending(components: "Sources", "Library", "new.swift")
+            try localFileSystem.writeFileContents(sourceFile, bytes: "")
+            let log2 = try build()
+            XCTAssertTrue(log2.contains("PackageStructure") || log2.contains("Planning build"), log2)
+
+            // Check that we don't run planning when a source file is modified.
+            try localFileSystem.writeFileContents(sourceFile, bytes: "\n\n\n\n")
+            let log3 = try build()
+            XCTAssertFalse(log3.contains("PackageStructure") || log3.contains("Planning build"), log3)
+        }
+    }
 }

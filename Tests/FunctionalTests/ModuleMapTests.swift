@@ -10,23 +10,25 @@
 
 import XCTest
 import Commands
-import TestSupport
-import Basic
-import Utility
+import SPMTestSupport
+import TSCBasic
+import TSCUtility
+import Workspace
 
 class ModuleMapsTestCase: XCTestCase {
 
     private func fixture(name: String, cModuleName: String, rootpkg: String, body: @escaping (AbsolutePath, [String]) throws -> Void) {
-        TestSupport.fixture(name: name) { prefix in
+        SPMTestSupport.fixture(name: name) { prefix in
             let input = prefix.appending(components: cModuleName, "C", "foo.c")
-            let outdir = prefix.appending(components: rootpkg, ".build", Destination.host.target, "debug")
+            let triple = Resources.default.toolchain.triple
+            let outdir = prefix.appending(components: rootpkg, ".build", triple.tripleString, "debug")
             try makeDirectories(outdir)
-            let output = outdir.appending(component: "libfoo.\(Destination.host.dynamicLibraryExtension)")
-            try systemQuietly(["clang", "-shared", input.asString, "-o", output.asString])
+            let output = outdir.appending(component: "libfoo\(triple.dynamicLibraryExtension)")
+            try systemQuietly(["clang", "-shared", input.pathString, "-o", output.pathString])
 
-            var Xld = ["-L", outdir.asString]
-        #if os(Linux)
-            Xld += ["-rpath", outdir.asString]
+            var Xld = ["-L", outdir.pathString]
+        #if os(Linux) || os(Android)
+            Xld += ["-rpath", outdir.pathString]
         #endif
 
             try body(prefix, Xld)
@@ -38,10 +40,11 @@ class ModuleMapsTestCase: XCTestCase {
 
             XCTAssertBuilds(prefix.appending(component: "App"), Xld: Xld)
 
-            let targetPath = prefix.appending(components: "App", ".build", Destination.host.target)
-            let debugout = try Process.checkNonZeroExit(args: targetPath.appending(components: "debug", "App").asString)
+            let triple = Resources.default.toolchain.triple
+            let targetPath = prefix.appending(components: "App", ".build", triple.tripleString)
+            let debugout = try Process.checkNonZeroExit(args: targetPath.appending(components: "debug", "App").pathString)
             XCTAssertEqual(debugout, "123\n")
-            let releaseout = try Process.checkNonZeroExit(args: targetPath.appending(components: "release", "App").asString)
+            let releaseout = try Process.checkNonZeroExit(args: targetPath.appending(components: "release", "App").pathString)
             XCTAssertEqual(releaseout, "123\n")
         }
     }
@@ -52,13 +55,14 @@ class ModuleMapsTestCase: XCTestCase {
             XCTAssertBuilds(prefix.appending(component: "packageA"), Xld: Xld)
 
             func verify(_ conf: String, file: StaticString = #file, line: UInt = #line) throws {
-                let out = try Process.checkNonZeroExit(args: prefix.appending(components: "packageA", ".build", Destination.host.target, conf, "packageA").asString)
+                let triple = Resources.default.toolchain.triple
+                let out = try Process.checkNonZeroExit(args: prefix.appending(components: "packageA", ".build", triple.tripleString, conf, "packageA").pathString)
                 XCTAssertEqual(out, """
                     calling Y.bar()
                     Y.bar() called
                     X.foo() called
                     123
-                    
+
                     """)
             }
 
@@ -66,9 +70,4 @@ class ModuleMapsTestCase: XCTestCase {
             try verify("release")
         }
     }
-
-    static var allTests = [
-        ("testDirectDependency", testDirectDependency),
-        ("testTransitiveDependency", testTransitiveDependency),
-    ]
 }

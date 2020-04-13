@@ -10,9 +10,9 @@
 
 import XCTest
 
-import Basic
+import TSCBasic
 import PackageModel
-@testable import PackageLoading
+import PackageLoading
 
 class ModuleMapGeneration: XCTestCase {
 
@@ -134,14 +134,6 @@ class ModuleMapGeneration: XCTestCase {
         checkExpected("target 'Foo' failed modulemap generation; umbrella header defined at '/include/Foo.h', but " +
             "directories exist: /include/Bar; consider removing them")
     }
-
-    static var allTests = [
-        ("testModuleNameDirAndHeaderInInclude", testModuleNameDirAndHeaderInInclude),
-        ("testModuleNameHeaderInInclude", testModuleNameHeaderInInclude),
-        ("testOtherCases", testOtherCases),
-        ("testUnsupportedLayouts", testUnsupportedLayouts),
-        ("testWarnings", testWarnings),
-    ]
 }
 
 func ModuleMapTester(_ name: String, includeDir: String = "include", in fileSystem: FileSystem, _ body: (ModuleMapResult) -> Void) {
@@ -153,7 +145,7 @@ func ModuleMapTester(_ name: String, includeDir: String = "include", in fileSyst
     do {
         try generator.generateModuleMap(inDir: .root)
         // FIXME: Find a better way.
-        diagnostics = Set(warningStream.bytes.asReadableString.split(separator: "\n").map(String.init))
+        diagnostics = Set(warningStream.bytes.description.split(separator: "\n").map(String.init))
     } catch {
       diagnostics.insert("\(error)")
     }
@@ -184,7 +176,7 @@ final class ModuleMapResult {
         if diagnostics.contains(str) {
             diagnostics.remove(str)
         } else {
-            XCTFail("no error: \(str) or is already checked", file: file, line: line)
+            XCTFail("no error: \"\(str)\" or is already checked", file: file, line: line)
         }
     }
 

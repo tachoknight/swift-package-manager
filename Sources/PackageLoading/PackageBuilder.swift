@@ -8,32 +8,30 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
+import TSCBasic
 import PackageModel
-import Utility
-
-import enum PackageDescription.ProductType
-import class PackageDescription4.Product
-import class PackageDescription4.Target
-
-fileprivate typealias Product = PackageModel.Product
-fileprivate typealias Target = PackageModel.Target
+import TSCUtility
 
 /// An error in the structure or layout of a package.
 public enum ModuleError: Swift.Error {
 
     /// Describes a way in which a package layout is invalid.
     public enum InvalidLayoutType {
-        case multipleSourceRoots([String])
-        case unexpectedSourceFiles([String])
-        case modulemapInSources(String)
+        case multipleSourceRoots([AbsolutePath])
+        case modulemapInSources(AbsolutePath)
     }
 
-    /// Indicates two targets with the same name.
-    case duplicateModule(String)
+    /// Indicates two targets with the same name and their corresponding packages.
+    case duplicateModule(String, [String])
 
-    /// One or more referenced targets could not be found.
-    case modulesNotFound([String])
+    /// The referenced target could not be found.
+    case moduleNotFound(String, TargetDescription.TargetType)
+
+    /// The artifact for the binary target could not be found.
+    case artifactNotFound(String)
+
+    /// Invalid custom path.
+    case invalidCustomPath(target: String, path: String)
 
     /// Package layout is invalid.
     case invalidLayout(InvalidLayoutType)
@@ -53,24 +51,33 @@ public enum ModuleError: Swift.Error {
     /// We found multiple LinuxMain.swift files.
     case multipleLinuxMainFound(package: String, linuxMainFiles: [AbsolutePath])
 
-    /// The package should support version 3 compiler but doesn't.
-    case mustSupportSwift3Compiler(package: String)
-
     /// The tools version in use is not compatible with target's sources.
-    case incompatibleToolsVersions(package: String, required: [Int], current: Int)
+    case incompatibleToolsVersions(package: String, required: [SwiftLanguageVersion], current: ToolsVersion)
 
     /// The target path is outside the package.
     case targetOutsidePackage(package: String, target: String)
+
+    /// Unsupported target path
+    case unsupportedTargetPath(String)
+
+    /// Invalid header search path.
+    case invalidHeaderSearchPath(String)
+
+    /// Default localization not set in the presence of localized resources.
+    case defaultLocalizationNotSet
 }
 
 extension ModuleError: CustomStringConvertible {
     public var description: String {
         switch self {
-        case .duplicateModule(let name):
-            return "multiple targets named '\(name)'"
-        case .modulesNotFound(let targets):
-            let targets = targets.joined(separator: ", ")
-            return "could not find target(s): \(targets); use the 'path' property in the Swift 4 manifest to set a custom target path"
+        case .duplicateModule(let name, let packages):
+            let packages = packages.joined(separator: ", ")
+            return "multiple targets named '\(name)' in: \(packages)"
+        case .moduleNotFound(let target, let type):
+            let folderName = type == .test ? "Tests" : "Sources"
+            return "Source files for target \(target) should be located under '\(folderName)/\(target)', or a custom sources path can be set with the 'path' property in Package.swift"
+        case .artifactNotFound(let target):
+            return "artifact not found for target '\(target)'"
         case .invalidLayout(let type):
             return "package has unsupported layout; \(type)"
         case .invalidManifestConfig(let package, let message):
@@ -82,20 +89,26 @@ extension ModuleError: CustomStringConvertible {
         case .invalidPublicHeadersDirectory(let name):
             return "public headers directory path for '\(name)' is invalid or not contained in the target"
         case .overlappingSources(let target, let sources):
-            return "target '\(target)' has sources overlapping sources: \(sources.map({$0.asString}).joined(separator: ", "))"
+            return "target '\(target)' has sources overlapping sources: " +
+                sources.map({ $0.description }).joined(separator: ", ")
         case .multipleLinuxMainFound(let package, let linuxMainFiles):
-            let files = linuxMainFiles.map({ $0.asString }).sorted().joined(separator: ", ")
-            return "package '\(package)' has multiple linux main files: \(files)"
-        case .mustSupportSwift3Compiler(let package):
-            return "package '\(package)' must support Swift 3 because its minimum tools version is 3"
+            return "package '\(package)' has multiple linux main files: " +
+                linuxMainFiles.map({ $0.description }).sorted().joined(separator: ", ")
         case .incompatibleToolsVersions(let package, let required, let current):
             if required.isEmpty {
                 return "package '\(package)' supported Swift language versions is empty"
             }
-            let required = required.map(String.init).joined(separator: ", ")
-            return "package '\(package)' not compatible with current tools version (\(current)); it supports: \(required)"
+            return "package '\(package)' requires minimum Swift language version \(required[0]) which is not supported by the current tools version (\(current))"
         case .targetOutsidePackage(let package, let target):
             return "target '\(target)' in package '\(package)' is outside the package root"
+        case .unsupportedTargetPath(let targetPath):
+            return "target path '\(targetPath)' is not supported; it should be relative to package root"
+        case .invalidCustomPath(let target, let path):
+            return "invalid custom path '\(path)' for target '\(target)'"
+        case .invalidHeaderSearchPath(let path):
+            return "invalid header search path '\(path)'; header search path should not be outside the package root"
+        case .defaultLocalizationNotSet:
+            return "manifest property 'defaultLocalization' not set; it is required in the presence of localized resources"
         }
     }
 }
@@ -104,9 +117,7 @@ extension ModuleError.InvalidLayoutType: CustomStringConvertible {
     public var description: String {
         switch self {
         case .multipleSourceRoots(let paths):
-            return "multiple source roots found: " + paths.sorted().joined(separator: ", ")
-        case .unexpectedSourceFiles(let paths):
-            return "found loose source files: " + paths.sorted().joined(separator: ", ")
+          return "multiple source roots found: " + paths.map({ $0.description }).sorted().joined(separator: ", ")
         case .modulemapInSources(let path):
             return "modulemap '\(path)' should be inside the 'include' directory"
         }
@@ -119,21 +130,14 @@ extension Target {
     enum Error: Swift.Error {
 
         /// The target's name is invalid.
-        case invalidName(path: String, problem: ModuleNameProblem)
+        case invalidName(path: RelativePath, problem: ModuleNameProblem)
         enum ModuleNameProblem {
             /// Empty target name.
             case emptyName
-            /// Test target doesn't have a "Tests" suffix.
-            case noTestSuffix
-            /// Non-test target does have a "Tests" suffix.
-            case hasTestSuffix
         }
 
         /// The target contains an invalid mix of languages (e.g. both Swift and C).
-        case mixedSources(String)
-
-        /// The manifest contains duplicate targets.
-        case duplicateTargets([String])
+        case mixedSources(AbsolutePath)
     }
 }
 
@@ -144,8 +148,6 @@ extension Target.Error: CustomStringConvertible {
             return "invalid target name at '\(path)'; \(problem)"
         case .mixedSources(let path):
             return "target at '\(path)' contains mixed language source files; feature not supported"
-        case .duplicateTargets(let targets):
-            return "duplicate targets found: " + targets.joined(separator: ", ")
         }
     }
 }
@@ -155,10 +157,6 @@ extension Target.Error.ModuleNameProblem: CustomStringConvertible {
         switch self {
           case .emptyName:
             return "target names can not be empty"
-          case .noTestSuffix:
-            return "name of test targets must end in 'Tests'"
-          case .hasTestSuffix:
-            return "name of non-test targets cannot end in 'Tests'"
         }
     }
 }
@@ -166,19 +164,31 @@ extension Target.Error.ModuleNameProblem: CustomStringConvertible {
 extension Product {
     /// An error in a product definition.
     enum Error: Swift.Error {
-        case noModules(String)
-        case moduleNotFound(product: String, target: String)
+        case moduleEmpty(product: String, target: String)
     }
 }
 
 extension Product.Error: CustomStringConvertible {
     var description: String {
         switch self {
-        case .noModules(let product):
-            return "product '\(product)' doesn't reference any targets"
-        case .moduleNotFound(let product, let target):
-            return "target '\(target)' referenced in product '\(product)' could not be found"
+        case .moduleEmpty(let product, let target):
+            return "target '\(target)' referenced in product '\(product)' is empty"
         }
+    }
+}
+
+/// A structure representing the remote artifact information necessary to construct the package.
+public struct RemoteArtifact {
+
+    /// The URl the artifact was downloaded from.
+    public let url: String
+
+    /// The path to the downloaded artifact.
+    public let path: AbsolutePath
+
+    public init(url: String, path: AbsolutePath) {
+        self.url = url
+        self.path = path
     }
 }
 
@@ -193,52 +203,78 @@ public final class PackageBuilder {
     /// The path of the package.
     private let packagePath: AbsolutePath
 
+    /// Information concerning the different downloaded binary target artifacts.
+    private let remoteArtifacts: [RemoteArtifact]
+
     /// The filesystem package builder will run on.
     private let fileSystem: FileSystem
 
     /// The diagnostics engine.
     private let diagnostics: DiagnosticsEngine
 
-    /// True if this is the root package.
-    private let isRootPackage: Bool
-
     /// Create multiple test products.
     ///
     /// If set to true, one test product will be created for each test target.
     private let shouldCreateMultipleTestProducts: Bool
 
-    /// Returns true if the loaded manifest version is v3.
-    private var isVersion3Manifest: Bool {
-        switch manifest.package {
-        case .v3: return true
-        case .v4: return false
-        }
-    }
+    /// Create the special REPL product for this package.
+    private let createREPLProduct: Bool
+
+    /// The additionla file detection rules.
+    private let additionalFileRules: [FileRuleDescription]
 
     /// Create a builder for the given manifest and package `path`.
     ///
     /// - Parameters:
     ///   - manifest: The manifest of this package.
     ///   - path: The root path of the package.
+    ///   - artifactPaths: Paths to the downloaded binary target artifacts.
     ///   - fileSystem: The file system on which the builder should be run.
     ///   - diagnostics: The diagnostics engine.
-    ///   - isRootPackage: If this is a root package.
     ///   - createMultipleTestProducts: If enabled, create one test product for
     ///     each test target.
     public init(
         manifest: Manifest,
         path: AbsolutePath,
+        additionalFileRules: [FileRuleDescription] = [],
+        remoteArtifacts: [RemoteArtifact] = [],
         fileSystem: FileSystem = localFileSystem,
         diagnostics: DiagnosticsEngine,
-        isRootPackage: Bool,
-        shouldCreateMultipleTestProducts: Bool = false
+        shouldCreateMultipleTestProducts: Bool = false,
+        createREPLProduct: Bool = false
     ) {
-        self.isRootPackage = isRootPackage
         self.manifest = manifest
         self.packagePath = path
+        self.additionalFileRules = additionalFileRules
+        self.remoteArtifacts = remoteArtifacts
         self.fileSystem = fileSystem
         self.diagnostics = diagnostics
         self.shouldCreateMultipleTestProducts = shouldCreateMultipleTestProducts
+        self.createREPLProduct = createREPLProduct
+    }
+
+    /// Loads a package from a package repository using the resources associated with a particular `swiftc` executable.
+    ///
+    /// - Parameters:
+    ///     - packagePath: The absolute path of the package root.
+    ///     - swiftCompiler: The absolute path of a `swiftc` executable.
+    ///         Its associated resources will be used by the loader.
+    ///     - kind: The kind of package.
+    public static func loadPackage(
+        packagePath: AbsolutePath,
+        swiftCompiler: AbsolutePath,
+        diagnostics: DiagnosticsEngine,
+        kind: PackageReference.Kind = .root
+    ) throws -> Package {
+        let manifest = try ManifestLoader.loadManifest(
+            packagePath: packagePath,
+            swiftCompiler: swiftCompiler,
+            packageKind: kind)
+        let builder = PackageBuilder(
+            manifest: manifest,
+            path: packagePath,
+            diagnostics: diagnostics)
+        return try builder.construct()
     }
 
     /// Build a new package following the conventions.
@@ -256,6 +292,10 @@ public final class PackageBuilder {
             targetSearchPath: packagePath.appending(component: targetSpecialDirs.targetDir),
             testTargetSearchPath: packagePath.appending(component: targetSpecialDirs.testTargetDir)
         )
+    }
+
+    private func diagnosticLocation() -> DiagnosticLocation {
+        return PackageLocation.Local(name: manifest.name, packagePath: packagePath)
     }
 
     /// Computes the special directory where targets are present or should be placed in future.
@@ -285,7 +325,7 @@ public final class PackageBuilder {
 
     private func isValidSource(_ path: AbsolutePath) -> Bool {
         // Ignore files which don't match the expected extensions.
-        guard let ext = path.extension, SupportedLanguageExtension.validExtensions.contains(ext) else {
+        guard let ext = path.extension, SupportedLanguageExtension.validExtensions(toolsVersion: self.manifest.toolsVersion).contains(ext) else {
             return false
         }
 
@@ -297,11 +337,16 @@ public final class PackageBuilder {
         // Ignore linux main.
         if basename == SwiftTarget.linuxMainBasename { return false }
 
-        // Ignore symlinks to non-files.
-        if !fileSystem.isFile(path) { return false }
+        // Ignore paths which are not valid files.
+        if !fileSystem.isFile(path) {
 
-        // Ignore excluded files.
-        if excludedPaths.contains(path) { return false }
+            // Diagnose broken symlinks.
+            if fileSystem.isSymlink(path) {
+                diagnostics.emit(.brokenSymlink(path), location: diagnosticLocation())
+            }
+
+            return false
+        }
 
         // Ignore manifest files.
         if path.parentDirectory == packagePath {
@@ -324,7 +369,6 @@ public final class PackageBuilder {
         if base.hasSuffix(".xcodeproj") { return false }
         if base.hasSuffix(".playground") { return false }
         if base.hasPrefix(".") { return false }  // eg .git
-        if excludedPaths.contains(path) { return false }
         if path == packagesDirectory { return false }
         if !fileSystem.isDirectory(path) { return false }
         return true
@@ -334,114 +378,64 @@ public final class PackageBuilder {
         return packagePath.appending(component: "Packages")
     }
 
-    private var excludedPaths: [AbsolutePath] {
-        return manifest.package.exclude.map({ packagePath.appending(RelativePath($0)) })
-    }
-
     /// Returns path to all the items in a directory.
-    /// FIXME: This is generic functionality, and should move to FileSystem.
+    // FIXME: This is generic functionality, and should move to FileSystem.
     func directoryContents(_ path: AbsolutePath) throws -> [AbsolutePath] {
         return try fileSystem.getDirectoryContents(path).map({ path.appending(component: $0) })
-    }
-
-    /// Returns the path of the source directory, throwing an error in case of an invalid layout (such as the presence
-    /// of both `Sources` and `src` directories).
-    func sourceRoot() throws -> AbsolutePath {
-        let viableRoots = try fileSystem.getDirectoryContents(packagePath).filter({ basename in
-            let entry = packagePath.appending(component: basename)
-            if PackageBuilder.isSourceDirectory(pathComponent: basename) {
-                return fileSystem.isDirectory(entry) && !excludedPaths.contains(entry)
-            }
-            return false
-        })
-
-        switch viableRoots.count {
-        case 0:
-            return packagePath
-        case 1:
-            return packagePath.appending(component: viableRoots[0])
-        default:
-            // eg. there is a `Sources' AND a `src'
-            throw ModuleError.invalidLayout(.multipleSourceRoots(
-                viableRoots.map({ packagePath.appending(component: $0).asString })))
-        }
-    }
-
-    /// Returns true if pathComponent indicates a reserved directory.
-    public static func isReservedDirectory(pathComponent: String) -> Bool {
-        return isPackageDirectory(pathComponent: pathComponent) ||
-            isSourceDirectory(pathComponent: pathComponent) ||
-            isTestDirectory(pathComponent: pathComponent)
-    }
-
-    /// Returns true if pathComponent indicates a package directory.
-    public static func isPackageDirectory(pathComponent: String) -> Bool {
-        return pathComponent.lowercased() == "packages"
-    }
-
-    /// Returns true if pathComponent indicates a source directory.
-    public static func isSourceDirectory(pathComponent: String) -> Bool {
-        switch pathComponent.lowercased() {
-        case "sources", "source", "src", "srcs":
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// Returns true if pathComponent indicates a test directory.
-    public static func isTestDirectory(pathComponent: String) -> Bool {
-        return pathComponent.lowercased() == "tests"
     }
 
     /// Private function that creates and returns a list of targets defined by a package.
     private func constructTargets() throws -> [Target] {
 
-        // Ensure no dupicate target definitions are found.
-        let duplicateTargetNames: [String] = manifest.package.targets.map({ $0.name
-        }).findDuplicates()
-        
-        if !duplicateTargetNames.isEmpty {
-            throw Target.Error.duplicateTargets(duplicateTargetNames)
-        }
-
         // Check for a modulemap file, which indicates a system target.
         let moduleMapPath = packagePath.appending(component: moduleMapFilename)
         if fileSystem.isFile(moduleMapPath) {
-            // Package contains a modulemap at the top level, so we assuming it's a system target.
+
+            // Warn about any declared targets.
+            if !manifest.targets.isEmpty {
+                diagnostics.emit(
+                    .systemPackageDeclaresTargets(targets: Array(manifest.targets.map({ $0.name }))),
+                    location: diagnosticLocation()
+                )
+            }
+
+            // Emit deprecation notice.
+            if manifest.toolsVersion >= .v4_2 {
+                diagnostics.emit(.systemPackageDeprecation, location: diagnosticLocation())
+            }
+
+            // Package contains a modulemap at the top level, so we assuming
+            // it's a system library target.
             return [
-                CTarget(
+                SystemLibraryTarget(
                     name: manifest.name,
-                    path: packagePath,
-                    pkgConfig: manifest.package.pkgConfig,
-                    providers: manifest.package.providers)
+                    platforms: self.platforms(),
+                    path: packagePath, isImplicit: true,
+                    pkgConfig: manifest.pkgConfig,
+                    providers: manifest.providers)
             ]
         }
 
         // At this point the target can't be a system target, make sure manifest doesn't contain
         // system target specific configuration.
-        guard manifest.package.pkgConfig == nil else {
+        guard manifest.pkgConfig == nil else {
             throw ModuleError.invalidManifestConfig(
                 manifest.name, "the 'pkgConfig' property can only be used with a System Module Package")
         }
 
-        guard manifest.package.providers == nil else {
+        guard manifest.providers == nil else {
             throw ModuleError.invalidManifestConfig(
                 manifest.name, "the 'providers' property can only be used with a System Module Package")
         }
 
-        // Depending on the manifest version, use the correct convention system.
-        if isVersion3Manifest {
-            return try constructV3Targets()
-        }
         return try constructV4Targets()
     }
 
     /// Predefined source directories, in order of preference.
-    static let predefinedSourceDirectories = ["Sources", "Source", "src", "srcs"]
+    public static let predefinedSourceDirectories = ["Sources", "Source", "src", "srcs"]
 
     /// Predefined test directories, in order of preference.
-    static let predefinedTestDirectories = ["Tests", "Sources", "Source", "src", "srcs"]
+    public static let predefinedTestDirectories = ["Tests", "Sources", "Source", "src", "srcs"]
 
     /// Finds the predefined directories for regular and test targets.
     private func findPredefinedTargetDirectory() -> (targetDir: String, testTargetDir: String) {
@@ -456,19 +450,38 @@ public final class PackageBuilder {
         return (targetDir, testTargetDir)
     }
 
+    struct PredefinedTargetDirectory {
+        let path: AbsolutePath
+        let contents: [String]
+
+        init(fs: FileSystem, path: AbsolutePath) {
+            self.path = path
+            self.contents = (try? fs.getDirectoryContents(path)) ?? []
+        }
+    }
+
     /// Construct targets according to PackageDescription 4 conventions.
     fileprivate func constructV4Targets() throws -> [Target] {
         // Select the correct predefined directory list.
         let predefinedDirs = findPredefinedTargetDirectory()
 
+        let predefinedTargetDirectory = PredefinedTargetDirectory(fs: fileSystem, path: packagePath.appending(component: predefinedDirs.targetDir))
+        let predefinedTestTargetDirectory = PredefinedTargetDirectory(fs: fileSystem, path: packagePath.appending(component: predefinedDirs.testTargetDir))
+
         /// Returns the path of the given target.
-        func findPath(for target: PackageDescription4.Target) throws -> AbsolutePath {
+        func findPath(for target: TargetDescription) throws -> AbsolutePath {
             // If there is a custom path defined, use that.
             if let subpath = target.path {
                 if subpath == "" || subpath == "." {
                     return packagePath
                 }
-                let path = packagePath.appending(RelativePath(subpath))
+
+                // Make sure target is not refenced by absolute path
+                guard let relativeSubPath = try? RelativePath(validating: subpath) else {
+                    throw ModuleError.unsupportedTargetPath(subpath)
+                }
+
+                let path = packagePath.appending(relativeSubPath)
                 // Make sure the target is inside the package root.
                 guard path.contains(packagePath) else {
                     throw ModuleError.targetOutsidePackage(package: manifest.name, target: target.name)
@@ -476,105 +489,66 @@ public final class PackageBuilder {
                 if fileSystem.isDirectory(path) {
                     return path
                 }
-                throw ModuleError.modulesNotFound([target.name])
+                throw ModuleError.invalidCustomPath(target: target.name, path: subpath)
+            } else if target.type == .binary {
+                if let artifact = remoteArtifacts.first(where: { $0.path.basenameWithoutExt == target.name }) {
+                    return artifact.path
+                } else {
+                    throw ModuleError.artifactNotFound(target.name)
+                }
             }
 
             // Check if target is present in the predefined directory.
-            let predefinedDir = target.isTest ? predefinedDirs.testTargetDir : predefinedDirs.targetDir
-            let path = packagePath.appending(components: predefinedDir, target.name)
-            if fileSystem.isDirectory(path) {
+            let predefinedDir = target.isTest ? predefinedTestTargetDirectory : predefinedTargetDirectory
+            let path = predefinedDir.path.appending(component: target.name)
+
+            // Return the path if the predefined directory contains it.
+            if predefinedDir.contents.contains(target.name) {
                 return path
             }
-            throw ModuleError.modulesNotFound([target.name])
+
+            // Otherwise, if the path "exists" then the case in manifest differs from the case on the file system.
+            if fileSystem.isDirectory(path) {
+                diagnostics.emit(.targetNameHasIncorrectCase(target: target.name), location: diagnosticLocation())
+                return path
+            }
+            throw ModuleError.moduleNotFound(target.name, target.type)
         }
 
         // Create potential targets.
         let potentialTargets: [PotentialModule]
-        potentialTargets = try manifest.package.targets.map({ target in
+        potentialTargets = try manifest.allRequiredTargets.map({ target in
             let path = try findPath(for: target)
-            return PotentialModule(name: target.name, path: path, isTest: target.isTest)
+            return PotentialModule(name: target.name, path: path, type: target.type)
         })
         return try createModules(potentialTargets)
-    }
-
-    /// Construct targets according to PackageDescription 3 conventions.
-    fileprivate func constructV3Targets() throws -> [Target] {
-
-        // If the package lists swift language versions, ensure that it declares
-        // that its sources are compatible with Swift 3 compiler since this
-        // manifest is allowed to be picked by Swift 3 tools during resolution.
-        if let swiftLanguageVersions = manifest.package.swiftLanguageVersions {
-            guard swiftLanguageVersions.contains(ManifestVersion.three.rawValue) else {
-                throw ModuleError.mustSupportSwift3Compiler(package: manifest.name)
-            }
-        }
-
-        // If everything is excluded, just return an empty array.
-        if manifest.package.exclude.contains(".") {
-            return []
-        }
-
-        // Locate the source directory inside the package.
-        let srcDir = try sourceRoot()
-
-        // If there is a source directory, we expect all source files to be located in it.
-        if srcDir != packagePath {
-            let invalidRootFiles = try directoryContents(packagePath).filter(isValidSource)
-            guard invalidRootFiles.isEmpty else {
-                throw ModuleError.invalidLayout(.unexpectedSourceFiles(invalidRootFiles.map({ $0.asString })))
-            }
-        }
-
-        // Locate any directories that might be the roots of targets inside the source directory.
-        let potentialModulePaths = try directoryContents(srcDir).filter(shouldConsiderDirectory)
-
-        // If atleast one target in the source directory, make sure there are no loose source files in the sources
-        // directory.
-        if let firstPath = potentialModulePaths.first, firstPath != srcDir {
-            let invalidModuleFiles = try directoryContents(srcDir).filter(isValidSource)
-            guard invalidModuleFiles.isEmpty else {
-                throw ModuleError.invalidLayout(.unexpectedSourceFiles(invalidModuleFiles.map({ $0.asString })))
-            }
-        }
-
-        // With preliminary checks done, we can start creating targets.
-        let potentialModules: [PotentialModule]
-        if potentialModulePaths.isEmpty {
-            // There are no directories that look like targets, so try to create a target for the source directory
-            // itself (with the name coming from the name in the manifest).
-            potentialModules = [PotentialModule(name: manifest.name, path: srcDir, isTest: false)]
-        } else {
-            potentialModules = potentialModulePaths.map({ PotentialModule(name: $0.basename, path: $0, isTest: false) })
-        }
-        return try createModules(potentialModules + potentialTestModules())
     }
 
     // Create targets from the provided potential targets.
     private func createModules(_ potentialModules: [PotentialModule]) throws -> [Target] {
         // Find if manifest references a target which isn't present on disk.
-        let allReferencedModules = manifest.allReferencedModules()
+        let allVisibleModuleNames = manifest.allVisibleModuleNames()
         let potentialModulesName = Set(potentialModules.map({ $0.name }))
-        let missingModules = allReferencedModules.subtracting(potentialModulesName).intersection(allReferencedModules)
-        guard missingModules.isEmpty else {
-            throw ModuleError.modulesNotFound(missingModules.map({ $0 }))
+        let missingModuleNames = allVisibleModuleNames.subtracting(potentialModulesName)
+        if let missingModuleName = missingModuleNames.first {
+            let type = potentialModules.first(where: { $0.name == missingModuleName })?.type ?? .regular
+            throw ModuleError.moduleNotFound(missingModuleName, type)
         }
 
-        let targetItems = manifest.package.targets.map({ ($0.name, $0 as PackageDescription4.Target) })
-        let targetMap = Dictionary(items: targetItems)
-        let potentialModuleMap = Dictionary(items: potentialModules.map({ ($0.name, $0) }))
+        let potentialModuleMap = Dictionary(potentialModules.map({ ($0.name, $0) }), uniquingKeysWith: { $1 })
         let successors: (PotentialModule) -> [PotentialModule] = {
             // No reference of this target in manifest, i.e. it has no dependencies.
-            guard let target = targetMap[$0.name] else { return [] }
-            return target.dependencies.flatMap({
+            guard let target = self.manifest.targetMap[$0.name] else { return [] }
+            return target.dependencies.compactMap({
                 switch $0 {
-                case .targetItem(let name):
+                case .target(let name, _):
                     // Since we already checked above that all referenced targets
-                    // has to present, we always expect this target to be present in 
+                    // has to present, we always expect this target to be present in
                     // potentialModules dictionary.
                     return potentialModuleMap[name]!
-                case .productItem:
+                case .product:
                     return nil
-                case .byNameItem(let name):
+                case .byName(let name, _):
                     // By name dependency may or may not be a target dependency.
                     return potentialModuleMap[name]
                 }
@@ -596,63 +570,55 @@ public final class PackageBuilder {
         for potentialModule in potentialModules.lazy.reversed() {
             // Validate the target name.  This function will throw an error if it detects a problem.
             try validateModuleName(potentialModule.path, potentialModule.name, isTest: potentialModule.isTest)
-            // Get the intra-package dependencies of this target.
-            var deps: [Target] = targetMap[potentialModule.name].map({
-                $0.dependencies.flatMap({
-                    switch $0 {
-                    case .targetItem(let name):
-                        // We don't create an object for targets which have no sources.
-                        if emptyModules.contains(name) { return nil }
-                        return targets[name]!
-
-                    case .byNameItem(let name):
-                        // We don't create an object for targets which have no sources.
-                        if emptyModules.contains(name) { return nil }
-                        return targets[name]
-
-                    case .productItem: return nil
-                    }
-                })
-            }) ?? []
-
-            // For test targets, add dependencies to its base target, if it has
-            // no explicit dependency. We only do this for v3 manifests to
-            // maintain compatibility.
-            if isVersion3Manifest && potentialModule.isTest && deps.isEmpty {
-                if let baseModule = targets[potentialModule.basename] {
-                    deps.append(baseModule)
-                }
-            }
 
             // Get the target from the manifest.
-            let manifestTarget = targetMap[potentialModule.name]
+            let manifestTarget = manifest.targetMap[potentialModule.name]
 
-            // Figure out the product dependencies.
-            let productDeps: [(String, String?)]
-            productDeps = manifestTarget?.dependencies.flatMap({
-                switch $0 {
-                case .targetItem:
-                    return nil
-                case .byNameItem(let name):
-                    // If this dependency was not found locally, it is a product dependency.
-                    return potentialModuleMap[name] == nil ? (name, nil) : nil
-                case .productItem(let name, let package):
-                    return (name, package)
+            // Get the dependencies of this target.
+            let dependencies: [Target.Dependency] = manifestTarget.map {
+                $0.dependencies.compactMap { dependency in
+                    switch dependency {
+                    case .target(let name, let condition):
+                        // We don't create an object for targets which have no sources.
+                        if emptyModules.contains(name) { return nil }
+                        guard let target = targets[name] else { return nil }
+                        return .target(target, conditions: buildConditions(from: condition))
+
+                    case .product(let name, let package, let condition):
+                        return .product(
+                            .init(name: name, package: package),
+                            conditions: buildConditions(from: condition)
+                        )
+
+                    case .byName(let name, let condition):
+                        // We don't create an object for targets which have no sources.
+                        if emptyModules.contains(name) { return nil }
+                        if let target = targets[name] {
+                            return .target(target, conditions: buildConditions(from: condition))
+                        } else if potentialModuleMap[name] == nil {
+                            return .product(
+                                .init(name: name, package: nil),
+                                conditions: buildConditions(from: condition)
+                            )
+                        } else {
+                            return nil
+                        }
+                    }
                 }
-            }) ?? []
+            } ?? []
 
             // Create the target.
             let target = try createTarget(
                 potentialModule: potentialModule,
                 manifestTarget: manifestTarget,
-                moduleDependencies: deps, 
-                productDeps: productDeps)
+                dependencies: dependencies
+            )
             // Add the created target to the map or print no sources warning.
             if let createdTarget = target {
                 targets[createdTarget.name] = createdTarget
             } else {
                 emptyModules.insert(potentialModule.name)
-                diagnostics.emit(data: PackageBuilderDiagnostics.NoSources(package: manifest.name, target: potentialModule.name))
+                diagnostics.emit(.targetHasNoSources(targetPath: potentialModule.path.pathString, target: potentialModule.name))
             }
         }
         return targets.values.map({ $0 })
@@ -663,172 +629,281 @@ public final class PackageBuilder {
     private func validateModuleName(_ path: AbsolutePath, _ name: String, isTest: Bool) throws {
         if name.isEmpty {
             throw Target.Error.invalidName(
-                path: path.relative(to: packagePath).asString,
+                path: path.relative(to: packagePath),
                 problem: .emptyName)
-        }
-        // We only need to do the below checks for PackageDescription 3.
-        if !isVersion3Manifest { return }
-
-        if name.hasSuffix(Target.testModuleNameSuffix) && !isTest {
-            throw Target.Error.invalidName(
-                path: path.relative(to: packagePath).asString,
-                problem: .hasTestSuffix)
-        }
-
-        if !name.hasSuffix(Target.testModuleNameSuffix) && isTest {
-            throw Target.Error.invalidName(
-                path: path.relative(to: packagePath).asString,
-                problem: .noTestSuffix)
         }
     }
 
     /// Private function that constructs a single Target object for the potential target.
     private func createTarget(
         potentialModule: PotentialModule,
-        manifestTarget: PackageDescription4.Target?,
-        moduleDependencies: [Target],
-        productDeps: [(name: String, package: String?)]
+        manifestTarget: TargetDescription?,
+        dependencies: [Target.Dependency]
     ) throws -> Target? {
+        guard let manifestTarget = manifestTarget else { return nil }
+
+        // Create system library target.
+        if potentialModule.type == .system {
+            let moduleMapPath = potentialModule.path.appending(component: moduleMapFilename)
+            guard fileSystem.isFile(moduleMapPath) else {
+                return nil
+            }
+
+            return SystemLibraryTarget(
+                name: potentialModule.name,
+                platforms: self.platforms(),
+                path: potentialModule.path, isImplicit: false,
+                pkgConfig: manifestTarget.pkgConfig,
+                providers: manifestTarget.providers
+            )
+        } else if potentialModule.type == .binary {
+            let remoteURL = remoteArtifacts.first(where: { $0.path == potentialModule.path })
+            let artifactSource: BinaryTarget.ArtifactSource = remoteURL.map({ .remote(url: $0.url) }) ?? .local
+            return BinaryTarget(
+                name: potentialModule.name,
+                platforms: self.platforms(),
+                path: potentialModule.path,
+                artifactSource: artifactSource
+            )
+        }
+
+        // Check for duplicate target dependencies by name
+        let combinedDependencyNames = dependencies.map { $0.target?.name ?? $0.product!.name }
+        combinedDependencyNames.spm_findDuplicates().forEach {
+            diagnostics.emit(.duplicateTargetDependency(dependency: $0, target: potentialModule.name))
+        }
+
+        // Create the build setting assignment table for this target.
+        let buildSettings = try self.buildSettings(for: manifestTarget, targetRoot: potentialModule.path)
 
         // Compute the path to public headers directory.
-        let publicHeaderComponent = manifestTarget?.publicHeadersPath ?? ClangTarget.defaultPublicHeadersComponent
-        let publicHeadersPath = potentialModule.path.appending(RelativePath(publicHeaderComponent))
+        let publicHeaderComponent = manifestTarget.publicHeadersPath ?? ClangTarget.defaultPublicHeadersComponent
+        let publicHeadersPath = potentialModule.path.appending(try RelativePath(validating: publicHeaderComponent))
         guard publicHeadersPath.contains(potentialModule.path) else {
             throw ModuleError.invalidPublicHeadersDirectory(potentialModule.name)
         }
 
-        // Compute the excluded paths in the target.
-        let targetExcludedPaths: Set<AbsolutePath>
-        if let excludedSubPaths = manifestTarget?.exclude {
-            let excludedPaths = excludedSubPaths.map({ potentialModule.path.appending(RelativePath($0)) })
-            targetExcludedPaths = Set(excludedPaths)
-        } else {
-            targetExcludedPaths = []
+        let sourcesBuilder = TargetSourcesBuilder(
+            packageName: manifest.name,
+            packagePath: packagePath,
+            target: manifestTarget,
+            path: potentialModule.path,
+            defaultLocalization: manifest.defaultLocalization,
+            additionalFileRules: additionalFileRules,
+            toolsVersion: manifest.toolsVersion,
+            fs: fileSystem,
+            diags: diagnostics
+        )
+        let (sources, resources) = try sourcesBuilder.run()
+
+        // Make sure defaultLocalization is set if the target has localized resources.
+        let hasLocalizedResources = resources.contains(where: { $0.localization != nil })
+        if hasLocalizedResources && manifest.defaultLocalization == nil {
+            throw ModuleError.defaultLocalizationNotSet
         }
 
-        // Contains the set of sources for this target.
-        var walked = Set<AbsolutePath>()
+        // The name of the bundle, if one is being generated.
+        let bundleName = resources.isEmpty ? nil : manifest.name + "_" + potentialModule.name
 
-        // Contains the paths we need to recursively iterate.
-        var pathsToWalk = [AbsolutePath]()
-
-        // If there are sources defined in the target use that.
-        if let definedSources = manifestTarget?.sources {
-            for definedSource in definedSources {
-                let definedSourcePath = potentialModule.path.appending(RelativePath(definedSource))
-                if fileSystem.isDirectory(definedSourcePath) {
-                    // If this is a directory, add it to the list of paths to walk.
-                    pathsToWalk.append(definedSourcePath)
-                } else if fileSystem.isFile(definedSourcePath) {
-                    // Otherwise, this is a sourcefile.
-                    walked.insert(definedSourcePath)
-                } else {
-                    // FIXME: Should we emit warning about this declared thing or silently ignore?
-                }
-            }
-        } else {
-            // Use the top level target path as the path to be walked.
-            pathsToWalk.append(potentialModule.path)
+        if sources.relativePaths.isEmpty && resources.isEmpty {
+            return nil
         }
-
-        // Walk each path and form our set of possible source files.
-        for pathToWalk in pathsToWalk {
-            let contents = try walk(pathToWalk, fileSystem: fileSystem, recursing: { path in
-                // Exclude the public header directory.
-                if path == publicHeadersPath { return false }
-
-                // Exclude if it in the excluded paths of the target.
-                if targetExcludedPaths.contains(path) { return false }
-
-                // Exclude if it in the excluded paths.
-                if self.excludedPaths.contains(path) { return false }
-
-                // Exclude the directories that should never be walked.
-                let base = path.basename
-                if base.hasSuffix(".xcodeproj") || base.hasSuffix(".playground") || base.hasPrefix(".") {
-                    return false
-                }
-
-                // We have to support these checks for PackageDescription 3.
-                if self.isVersion3Manifest {
-                    if base.lowercased() == "tests" { return false }
-                    if path == self.packagesDirectory { return false }
-                }
-
-                return true
-            }).map({$0})
-            walked.formUnion(contents)
-        }
-
-        // Make sure there is no modulemap mixed with the sources.
-        if let path = walked.first(where: { $0.basename == moduleMapFilename }) {
-            throw ModuleError.invalidLayout(.modulemapInSources(path.asString))
-        }
-        // Select any source files for the C-based languages and for Swift.
-        let sources = walked.filter(isValidSource).filter({ !targetExcludedPaths.contains($0) })
-        let cSources = sources.filter({ SupportedLanguageExtension.cFamilyExtensions.contains($0.extension!) })
-        let swiftSources = sources.filter({ SupportedLanguageExtension.swiftExtensions.contains($0.extension!) })
-        assert(sources.count == cSources.count + swiftSources.count)
+        try validateSourcesOverlapping(forTarget: potentialModule.name, sources: sources.paths)
 
         // Create and return the right kind of target depending on what kind of sources we found.
-        if cSources.isEmpty {
-            guard !swiftSources.isEmpty else { return nil }
-            let swiftSources = Array(swiftSources)
-            try validateSourcesOverlapping(forTarget: potentialModule.name, sources: swiftSources)
-            // No C sources, so we expect to have Swift sources, and we create a Swift target.
+        if sources.hasSwiftSources {
             return SwiftTarget(
                 name: potentialModule.name,
+                bundleName: bundleName,
+                defaultLocalization: manifest.defaultLocalization,
+                platforms: self.platforms(),
                 isTest: potentialModule.isTest,
-                sources: Sources(paths: swiftSources, root: potentialModule.path),
-                dependencies: moduleDependencies,
-                productDependencies: productDeps,
-                swiftVersion: try swiftVersion())
+                sources: sources,
+                resources: resources,
+                dependencies: dependencies,
+                swiftVersion: try swiftVersion(),
+                buildSettings: buildSettings
+            )
         } else {
-            // No Swift sources, so we expect to have C sources, and we create a C target.
-            guard swiftSources.isEmpty else { throw Target.Error.mixedSources(potentialModule.path.asString) }
-            let cSources = Array(cSources)
-            try validateSourcesOverlapping(forTarget: potentialModule.name, sources: cSources)
-
-            let sources = Sources(paths: cSources, root: potentialModule.path)
-
             return ClangTarget(
                 name: potentialModule.name,
-                cLanguageStandard: manifest.package.cLanguageStandard?.rawValue,
-                cxxLanguageStandard: manifest.package.cxxLanguageStandard?.rawValue,
+                bundleName: bundleName,
+                defaultLocalization: manifest.defaultLocalization,
+                platforms: self.platforms(),
+                cLanguageStandard: manifest.cLanguageStandard,
+                cxxLanguageStandard: manifest.cxxLanguageStandard,
                 includeDir: publicHeadersPath,
                 isTest: potentialModule.isTest,
                 sources: sources,
-                dependencies: moduleDependencies,
-                productDependencies: productDeps)
+                resources: resources,
+                dependencies: dependencies,
+                buildSettings: buildSettings
+            )
         }
     }
 
+    /// Creates build setting assignment table for the given target.
+    func buildSettings(for target: TargetDescription?, targetRoot: AbsolutePath) throws -> BuildSettings.AssignmentTable {
+        var table = BuildSettings.AssignmentTable()
+        guard let target = target else { return table }
+
+        // Process each setting.
+        for setting in target.settings {
+            let decl: BuildSettings.Declaration
+
+            // Compute appropriate declaration for the setting.
+            switch setting.name {
+            case .headerSearchPath:
+
+                switch setting.tool {
+                case .c, .cxx:
+                    decl = .HEADER_SEARCH_PATHS
+                case .swift, .linker:
+                    fatalError("unexpected tool for setting type \(setting)")
+                }
+
+                // Ensure that the search path is contained within the package.
+                let subpath = try RelativePath(validating: setting.value[0])
+                guard targetRoot.appending(subpath).contains(packagePath) else {
+                    throw ModuleError.invalidHeaderSearchPath(subpath.pathString)
+                }
+
+            case .define:
+                switch setting.tool {
+                case .c, .cxx:
+                    decl = .GCC_PREPROCESSOR_DEFINITIONS
+                case .swift:
+                    decl = .SWIFT_ACTIVE_COMPILATION_CONDITIONS
+                case .linker:
+                    fatalError("unexpected tool for setting type \(setting)")
+                }
+
+            case .linkedLibrary:
+                switch setting.tool {
+                case .c, .cxx, .swift:
+                    fatalError("unexpected tool for setting type \(setting)")
+                case .linker:
+                    decl = .LINK_LIBRARIES
+                }
+
+            case .linkedFramework:
+                switch setting.tool {
+                case .c, .cxx, .swift:
+                    fatalError("unexpected tool for setting type \(setting)")
+                case .linker:
+                    decl = .LINK_FRAMEWORKS
+                }
+
+            case .unsafeFlags:
+                switch setting.tool {
+                case .c:
+                    decl = .OTHER_CFLAGS
+                case .cxx:
+                    decl = .OTHER_CPLUSPLUSFLAGS
+                case .swift:
+                    decl = .OTHER_SWIFT_FLAGS
+                case .linker:
+                    decl = .OTHER_LDFLAGS
+                }
+            }
+
+            // Create an assignment for this setting.
+            var assignment = BuildSettings.Assignment()
+            assignment.value = setting.value
+            assignment.conditions = buildConditions(from: setting.condition)
+
+            // Finally, add the assignment to the assignment table.
+            table.add(assignment, for: decl)
+        }
+
+        return table
+    }
+
+    func buildConditions(from condition: PackageConditionDescription?) -> [PackageConditionProtocol] {
+        var conditions: [PackageConditionProtocol] = []
+
+        if let config = condition?.config.map({ BuildConfiguration(rawValue: $0)! }) {
+            let condition = ConfigurationCondition(configuration: config)
+            conditions.append(condition)
+        }
+
+        if let platforms = condition?.platformNames.map({ platformRegistry.platformByName[$0]! }), !platforms.isEmpty {
+            let condition = PlatformsCondition(platforms: platforms)
+            conditions.append(condition)
+        }
+
+        return conditions
+    }
+
+    /// Returns the list of platforms supported by the manifest.
+    func platforms() -> [SupportedPlatform] {
+        if let platforms = _platforms {
+            return platforms
+        }
+
+        var supportedPlatforms: [SupportedPlatform] = []
+
+        /// Add each declared platform to the supported platforms list.
+        for platform in manifest.platforms {
+
+            let supportedPlatform = SupportedPlatform(
+                platform: platformRegistry.platformByName[platform.platformName]!,
+                version: PlatformVersion(platform.version),
+                options: platform.options
+            )
+
+            supportedPlatforms.append(supportedPlatform)
+        }
+
+        // Find the undeclared platforms.
+        let remainingPlatforms = Set(platformRegistry.platformByName.keys).subtracting(supportedPlatforms.map({ $0.platform.name }))
+
+        /// Start synthesizing for each undeclared platform.
+        for platformName in remainingPlatforms {
+            let platform = platformRegistry.platformByName[platformName]!
+
+            let supportedPlatform = SupportedPlatform(
+                platform: platform,
+                version: platform.oldestSupportedVersion,
+                options: []
+            )
+
+            supportedPlatforms.append(supportedPlatform)
+        }
+
+        _platforms = supportedPlatforms
+        return _platforms!
+    }
+    private var _platforms: [SupportedPlatform]? = nil
+
+    /// The platform registry instance.
+    private var platformRegistry: PlatformRegistry {
+        return PlatformRegistry.default
+    }
+
     /// Computes the swift version to use for this manifest.
-    private func swiftVersion() throws -> Int {
+    private func swiftVersion() throws -> SwiftLanguageVersion {
         if let swiftVersion = _swiftVersion {
             return swiftVersion
         }
-        let computedSwiftVersion: Int
+
+        let computedSwiftVersion: SwiftLanguageVersion
+
         // Figure out the swift version from declared list in the manifest.
-        if let swiftLanguageVersions = manifest.package.swiftLanguageVersions {
-            let majorToolsVersion = ToolsVersion.currentToolsVersion.major
-            guard let swiftVersion = swiftLanguageVersions.sorted(by: >).first(where: { $0 <= majorToolsVersion }) else {
+        if let swiftLanguageVersions = manifest.swiftLanguageVersions {
+            guard let swiftVersion = swiftLanguageVersions.sorted(by: >).first(where: { $0 <= ToolsVersion.currentToolsVersion }) else {
                 throw ModuleError.incompatibleToolsVersions(
-                    package: manifest.name, required: swiftLanguageVersions, current: majorToolsVersion)
+                    package: manifest.name, required: swiftLanguageVersions, current: .currentToolsVersion)
             }
             computedSwiftVersion = swiftVersion
-        } else if isVersion3Manifest {
-            // Otherwise, use the version depending on the manifest version.
-            // FIXME: This feels weird, we should store the reference of the tools
-            // version inside the manifest so we can return the major version directly.
-            computedSwiftVersion = ManifestVersion.three.rawValue
         } else {
-            computedSwiftVersion = ManifestVersion.four.rawValue
+            // Otherwise, use the version depending on the manifest version.
+            computedSwiftVersion = manifest.toolsVersion.swiftLanguageVersion
         }
-        _swiftVersion = computedSwiftVersion 
+        _swiftVersion = computedSwiftVersion
         return computedSwiftVersion
     }
-    private var _swiftVersion: Int? = nil
+    private var _swiftVersion: SwiftLanguageVersion? = nil
 
     /// The set of the sources computed so far.
     private var allSources = Set<AbsolutePath>()
@@ -836,40 +911,17 @@ public final class PackageBuilder {
     /// Validates that the sources of a target are not already present in another target.
     private func validateSourcesOverlapping(forTarget target: String, sources: [AbsolutePath]) throws {
         // Compute the sources which overlap with already computed targets.
-        var overlappingSources = [AbsolutePath]()
+        var overlappingSources: Set<AbsolutePath> = []
         for source in sources {
             if !allSources.insert(source).inserted {
-                overlappingSources.append(source)
+                overlappingSources.insert(source)
             }
         }
 
         // Throw if we found any overlapping sources.
         if !overlappingSources.isEmpty {
-            throw ModuleError.overlappingSources(target: target, sources: overlappingSources)
+            throw ModuleError.overlappingSources(target: target, sources: Array(overlappingSources))
         }
-    }
-
-    /// Scans tests directory and returns potential targets from it.
-    private func potentialTestModules() throws -> [PotentialModule] {
-        let testsPath = packagePath.appending(component: "Tests")
-
-        // Don't try to walk Tests if it is in excludes or doesn't exists.
-        guard fileSystem.isDirectory(testsPath) && !excludedPaths.contains(testsPath) else {
-            return []
-        }
-
-        // Get the contents of the Tests directory.
-        let testsDirContents = try directoryContents(testsPath)
-
-        // Check that the Tests directory doesn't contain any loose source files.
-        let looseSourceFiles = testsDirContents.filter(isValidSource)
-        guard looseSourceFiles.isEmpty else {
-            throw ModuleError.invalidLayout(.unexpectedSourceFiles(looseSourceFiles.map({ $0.asString })))
-        }
-
-        return testsDirContents
-            .filter(shouldConsiderDirectory)
-            .map({ PotentialModule(name: $0.basename, path: $0, isTest: true) })
     }
 
     /// Find the linux main file for the package.
@@ -879,8 +931,18 @@ public final class PackageBuilder {
 
         // Look for linux main file adjacent to each test target root, iterating upto package root.
         for target in testTargets {
+
+            // Form the initial search path.
+            //
+            // If the target root's parent directory is inside the package, start
+            // search there. Otherwise, we start search from the target root.
             var searchPath = target.sources.root.parentDirectory
+            if !searchPath.contains(packagePath) {
+                searchPath = target.sources.root
+            }
+
             while true {
+                assert(searchPath.contains(packagePath), "search path \(searchPath) is outside the package \(packagePath)")
                 // If we have already searched this path, skip.
                 if !pathsSearched.contains(searchPath) {
                     let linuxMain = searchPath.appending(component: SwiftTarget.linuxMainBasename)
@@ -913,8 +975,8 @@ public final class PackageBuilder {
             let inserted = products.append(KeyedPair(product, key: product.name))
             if !inserted {
                 diagnostics.emit(
-                    data: PackageBuilderDiagnostics.DuplicateProduct(product: product),
-                    location: PackageLocation.Local(name: manifest.name, packagePath: packagePath)
+                    .duplicateProduct(product: product),
+                    location: diagnosticLocation()
                 )
             }
         }
@@ -925,7 +987,7 @@ public final class PackageBuilder {
           #if os(Linux)
             // FIXME: Ignore C language test targets on linux for now.
             if target is ClangTarget {
-                diagnostics.emit(data: PackageBuilderDiagnostics.UnsupportedCTarget(
+                diagnostics.emit(.unsupportedCTestTarget(
                     package: manifest.name, target: target.name))
                 return false
             }
@@ -954,33 +1016,35 @@ public final class PackageBuilder {
         }
 
         // Map containing targets mapped to their names.
-        let modulesMap = Dictionary(items: targets.map({ ($0.name, $0) }))
+        let modulesMap = Dictionary(targets.map({ ($0.name, $0) }), uniquingKeysWith: { $1 })
 
         /// Helper method to get targets from target names.
         func modulesFrom(targetNames names: [String], product: String) throws -> [Target] {
-            // Ensure the target names are non-empty.
-            guard !names.isEmpty else { throw Product.Error.noModules(product) }
             // Get targets from target names.
-            let productModules: [Target] = try names.map({ targetName in
+            return try names.map({ targetName in
                 // Ensure we have this target.
                 guard let target = modulesMap[targetName] else {
-                    throw Product.Error.moduleNotFound(product: product, target: targetName)
+                    throw Product.Error.moduleEmpty(product: product, target: targetName)
                 }
                 return target
             })
-            return productModules
         }
 
-        // Create legacy products if any.
-        for p in manifest.legacyProducts {
-            let targets = try modulesFrom(targetNames: p.modules, product: p.name)
-            let product = Product(name: p.name, type: .init(p.type), targets: targets)
-            append(product)
-        }
+        // Only create implicit executables for root packages.
+        if manifest.packageKind == .root {
+            // Compute the list of targets which are being used in an
+            // executable product so we don't create implicit executables
+            // for them.
+            let executableProductTargets = manifest.products.flatMap({ product -> [String] in
+                switch product.type {
+                case .library, .test:
+                    return []
+                case .executable:
+                    return product.targets
+                }
+            })
 
-        // Auto creates executable products from executables targets if that
-        // target isn't already present in the declaredProductsTargets set.
-        func createExecutables(declaredProductsTargets: Set<String> = []) {
+            let declaredProductsTargets = Set(executableProductTargets)
             for target in targets where target.type == .executable {
                 // If this target already has an executable product, skip
                 // generating a product for it.
@@ -992,65 +1056,81 @@ public final class PackageBuilder {
             }
         }
 
-        // Create a product for the entire package.
-        switch manifest.package {
-        case .v3:
-            // Always create all executables in v3.
-            createExecutables()
-
-            // Create one product containing all of the package's library targets.
-            //
-            // We also check that there is no product with same name as the manifest.
-            // That could happen if there is an executable with the same name. In those
-            // cases we are unable to generate a libary product for this package.
-            let libraryModules = targets.filter({ $0.type == .library })
-            if !libraryModules.isEmpty && !products.map({ $0.key }).contains(manifest.name) {
-                append(Product(name: manifest.name, type: .library(.automatic), targets: libraryModules))
-            }
-
-        case .v4(let package):
-            // Only create implicit executables for root packages in v4.
-            if isRootPackage {
-                // Compute the list of targets which are being used in an
-                // executable product so we don't create implicit executables
-                // for them.
-                let executableProductTargets = package.products.flatMap({ product -> [String] in
-                    switch product {
-                    case let product as PackageDescription4.Product.Executable:
-                        return product.targets
-                    case is PackageDescription4.Product.Library:
-                        return []
-                    default:
-                        fatalError("Unreachable")
-                    }
-                })
-                createExecutables(declaredProductsTargets: Set(executableProductTargets))
-            }
-
-            for product in package.products {
-                switch product {
-                case let p as PackageDescription4.Product.Executable:
-                    let targets = try modulesFrom(targetNames: p.targets, product: p.name)
-                    append(Product(name: p.name, type: .executable, targets: targets))
-                case let p as PackageDescription4.Product.Library:
-                    // Get the library type.
-                    let type: PackageModel.ProductType
-                    switch p.type {
-                    case .static?: type = .library(.static)
-                    case .dynamic?: type = .library(.dynamic)
-                    case nil: type = .library(.automatic)
-                    }
-                    let targets = try modulesFrom(targetNames: p.targets, product: p.name)
-                    append(Product(name: p.name, type: type, targets: targets))
-                default:
-                    fatalError("Unreachable")
+        for product in manifest.products {
+            let targets = try modulesFrom(targetNames: product.targets, product: product.name)
+            // Peform special validations if this product is exporting
+            // a system library target.
+            if targets.contains(where: { $0 is SystemLibraryTarget }) {
+                if product.type != .library(.automatic) || targets.count != 1 {
+                    diagnostics.emit(
+                        .systemPackageProductValidation(product: product.name),
+                        location: diagnosticLocation()
+                    )
+                    continue
                 }
+            }
+
+            // Do some validation for executable products.
+            switch product.type {
+            case .library, .test:
+                break
+            case .executable:
+                guard validateExecutableProduct(product, with: targets) else {
+                    continue
+                }
+            }
+
+            append(Product(name: product.name, type: product.type, targets: targets))
+        }
+
+        // Create a special REPL product that contains all the library targets.
+        if createREPLProduct {
+            let libraryTargets = targets.filter({ $0.type == .library })
+            if libraryTargets.isEmpty {
+                diagnostics.emit(
+                    .noLibraryTargetsForREPL,
+                    location: diagnosticLocation()
+                )
+            } else {
+                let replProduct = Product(
+                    name: manifest.name + Product.replProductSuffix,
+                    type: .library(.dynamic),
+                    targets: libraryTargets
+                )
+                append(replProduct)
             }
         }
 
         return products.map({ $0.item })
     }
 
+    private func validateExecutableProduct(_ product: ProductDescription, with targets: [Target]) -> Bool {
+        let executableTargetCount = targets.filter { $0.type == .executable }.count
+        guard executableTargetCount == 1 else {
+            if executableTargetCount == 0 {
+                if let target = targets.spm_only {
+                    diagnostics.emit(
+                        .executableProductTargetNotExecutable(product: product.name, target: target.name),
+                        location: diagnosticLocation()
+                    )
+                } else {
+                    diagnostics.emit(
+                        .executableProductWithoutExecutableTarget(product: product.name),
+                        location: diagnosticLocation()
+                    )
+                }
+            } else {
+                diagnostics.emit(
+                    .executableProductWithMoreThanOneExecutableTarget(product: product.name),
+                    location: diagnosticLocation()
+                )
+            }
+
+            return false
+        }
+
+        return true
+    }
 }
 
 /// We create this structure after scanning the filesystem for potential targets.
@@ -1063,38 +1143,33 @@ private struct PotentialModule: Hashable {
     let path: AbsolutePath
 
     /// If this should be a test target.
-    let isTest: Bool
+    var isTest: Bool {
+        return type == .test
+    }
+
+    /// The target type.
+    let type: TargetDescription.TargetType
 
     /// The base prefix for the test target, used to associate with the target it tests.
     public var basename: String {
         guard isTest else {
-            fatalError("\(type(of: self)) should be a test target to access basename.")
+            fatalError("\(Swift.type(of: self)) should be a test target to access basename.")
         }
         precondition(name.hasSuffix(Target.testModuleNameSuffix))
         let endIndex = name.index(name.endIndex, offsetBy: -Target.testModuleNameSuffix.count)
         return String(name[name.startIndex..<endIndex])
     }
-
-    var hashValue: Int {
-        return name.hashValue ^ path.hashValue ^ isTest.hashValue
-    }
-
-    static func == (lhs: PotentialModule, rhs: PotentialModule) -> Bool {
-        return lhs.name == rhs.name &&
-               lhs.path == rhs.path &&
-               lhs.isTest == rhs.isTest
-    }
 }
 
 private extension Manifest {
-    /// Returns the names of all the referenced targets in the manifest.
-    func allReferencedModules() -> Set<String> {
-        let names = package.targets.flatMap({ target in
-            [target.name] + target.dependencies.flatMap({
+    /// Returns the names of all the visible targets in the manifest.
+    func allVisibleModuleNames() -> Set<String> {
+        let names = allRequiredTargets.flatMap({ target in
+            [target.name] + target.dependencies.compactMap({
                 switch $0 {
-                case .targetItem(let name):
+                case .target(let name, _):
                     return name
-                case .byNameItem, .productItem:
+                case .byName, .product:
                     return nil
                 }
             })
@@ -1103,19 +1178,14 @@ private extension Manifest {
     }
 }
 
-private extension PackageModel.ProductType {
+extension Sources {
+    var hasSwiftSources: Bool {
+        paths.first?.extension == "swift"
+    }
 
-    /// Create instance from package description's product type.
-    init(_ type: PackageDescription.ProductType) {
-        switch type {
-        case .Test:
-            self = .test
-        case .Executable:
-            self = .executable
-        case .Library(.Static):
-            self = .library(.static)
-        case .Library(.Dynamic):
-            self = .library(.dynamic)
-        }
+    var containsMixedLanguage: Bool {
+        let swiftSources = relativePaths.filter{ $0.extension == "swift" }
+        if swiftSources.isEmpty { return false }
+        return swiftSources.count != relativePaths.count
     }
 }

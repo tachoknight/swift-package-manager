@@ -10,12 +10,12 @@
 
 import XCTest
 
-import Basic
-import TestSupport
+import TSCBasic
+import SPMTestSupport
 import PackageLoading
 
 class ManifestLoadingPerfTests: XCTestCasePerf {
-    let manifestLoader = ManifestLoader(resources: Resources.default)
+    let manifestLoader = ManifestLoader(manifestResources: Resources.default)
 
     func write(_ bytes: ByteString, body: (AbsolutePath) -> ()) {
         mktmpdir { path in
@@ -26,6 +26,7 @@ class ManifestLoadingPerfTests: XCTestCasePerf {
     }
 
     func testTrivialManifestLoading_X1() {
+      #if os(macOS)
         let N = 1
         let trivialManifest = ByteString(encodingAsUTF8: ("""
             import PackageDescription
@@ -34,24 +35,31 @@ class ManifestLoadingPerfTests: XCTestCasePerf {
         write(trivialManifest) { path in
             measure {
                 for _ in 0..<N {
-                    let manifest = try! self.manifestLoader.load(package: path, baseURL: "/", manifestVersion: .three)
+                    let manifest = try! self.manifestLoader.load(
+                        package: path,
+                        baseURL: "/Trivial",
+                        toolsVersion: .v4_2,
+                        packageKind: .root)
                     XCTAssertEqual(manifest.name, "Trivial")
                 }
             }
         }
+      #endif
     }
 
     func testNonTrivialManifestLoading_X1() {
+      #if os(macOS)
         let N = 1
         let manifest = ByteString(encodingAsUTF8: """
             import PackageDescription
             let package = Package(
                 name: "Foo",
-                targets: [
-                    Target(name: "sys", dependencies: ["libc"]),
-                    Target(name: "dep", dependencies: ["sys", "libc"])],
                 dependencies: [
-                    .Package(url: "https://example.com/example", majorVersion: 1)
+                    .package(url: "https://example.com/example", from: "1.0.0")
+                ],
+                targets: [
+                    .target(name: "sys", dependencies: ["libc"]),
+                    .target(name: "dep", dependencies: ["sys", "libc"])
                 ]
             )
             """)
@@ -59,10 +67,15 @@ class ManifestLoadingPerfTests: XCTestCasePerf {
         write(manifest) { path in
             measure {
                 for _ in 0..<N {
-                    let manifest = try! self.manifestLoader.load(package: path, baseURL: "/", manifestVersion: .three)
+                    let manifest = try! self.manifestLoader.load(
+                        package: path,
+                        baseURL: "/Trivial",
+                        toolsVersion: .v4_2,
+                        packageKind: .root)
                     XCTAssertEqual(manifest.name, "Foo")
                 }
             }
         }
+      #endif
     }
 }

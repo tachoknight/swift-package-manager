@@ -8,19 +8,63 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
+import TSCBasic
 
 /// Represents a fully resolved target. All the dependencies for the target are resolved.
 public final class ResolvedTarget: CustomStringConvertible, ObjectIdentifierProtocol {
 
     /// Represents dependency of a resolved target.
-    public enum Dependency {
+    public enum Dependency: Hashable {
+        public static func == (lhs: ResolvedTarget.Dependency, rhs: ResolvedTarget.Dependency) -> Bool {
+            switch (lhs, rhs) {
+            case (.target(let lhsTarget, _), .target(let rhsTarget, _)):
+                return lhsTarget == rhsTarget
+            case (.product(let lhsProduct, _), .product(let rhsProduct, _)):
+                return lhsProduct == rhsProduct
+            case (.product, .target), (.target, .product):
+                return false
+            }
+        }
 
         /// Direct dependency of the target. This target is in the same package and should be statically linked.
-        case target(ResolvedTarget)
+        case target(_ target: ResolvedTarget, conditions: [PackageConditionProtocol])
 
         /// The target depends on this product.
-        case product(ResolvedProduct)
+        case product(_ product: ResolvedProduct, conditions: [PackageConditionProtocol])
+
+        public var target: ResolvedTarget? {
+            switch self {
+            case .target(let target, _): return target
+            case .product: return nil
+            }
+        }
+
+        public var product: ResolvedProduct? {
+            switch self {
+            case .target: return nil
+            case .product(let product, _): return product
+            }
+        }
+
+        public var conditions: [PackageConditionProtocol] {
+            switch self {
+            case .target(_, let conditions): return conditions
+            case .product(_, let conditions): return conditions
+            }
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            switch self {
+            case .target(let target, _):
+                hasher.combine(target)
+            case .product(let product, _):
+                hasher.combine(product)
+            }
+        }
+
+        public func satisfies(_ environment: BuildEnvironment) -> Bool {
+            conditions.allSatisfy { $0.satisfies(environment) }
+        }
     }
 
     /// The underlying target represented in this resolved target.
@@ -34,14 +78,32 @@ public final class ResolvedTarget: CustomStringConvertible, ObjectIdentifierProt
     /// The dependencies of this target.
     public let dependencies: [Dependency]
 
-    /// The transitive closure of the target dependencies. This will also include the
-    /// targets which needs to be dynamically linked.
-    public lazy var recursiveDependencies: [ResolvedTarget] = {
-        return try! topologicalSort(self.dependencies, successors: { $0.dependencies }).flatMap({
-            guard case .target(let target) = $0 else { return nil }
-            return target
-        })
-    }()
+    /// Returns dependencies which satisfy the input build environment, based on their conditions.
+    /// - Parameters:
+    ///     - environment: The build environment to use to filter dependencies on.
+    public func dependencies(satisfying environment: BuildEnvironment) -> [Dependency] {
+        return dependencies.filter { $0.satisfies(environment) }
+    }
+
+    /// Returns the recursive dependencies, accross the whole package-graph.
+    public func recursiveDependencies() -> [Dependency] {
+        return try! topologicalSort(self.dependencies) { $0.dependencies }
+    }
+
+    /// Returns the recursive target dependencies, accross the whole package-graph.
+    public func recursiveTargetDependencies() -> [ResolvedTarget] {
+        return try! topologicalSort(self.dependencies) { $0.dependencies }.compactMap { $0.target }
+    }
+
+    /// Returns the recursive dependencies, accross the whole package-graph, which satisfy the input build environment,
+    /// based on their conditions.
+    /// - Parameters:
+    ///     - environment: The build environment to use to filter dependencies on.
+    public func recursiveDependencies(satisfying environment: BuildEnvironment) -> [Dependency] {
+        return try! topologicalSort(dependencies(satisfying: environment)) { dependency in
+            return dependency.dependencies.filter { $0.satisfies(environment) }
+        }
+    }
 
     /// The language-level target name.
     public var c99name: String {
@@ -152,57 +214,59 @@ public final class ResolvedProduct: ObjectIdentifierProtocol, CustomStringConver
 
         self.linuxMainTarget = underlyingProduct.linuxMain.map({ linuxMain in
             // Create an exectutable resolved target with the linux main, adding product's targets as dependencies.
-            let swiftTarget = SwiftTarget(
-                linuxMain: linuxMain, name: product.name, dependencies: product.targets)
-            return ResolvedTarget(target: swiftTarget, dependencies: targets.map(ResolvedTarget.Dependency.target))
+            let dependencies: [Target.Dependency] = product.targets.map { .target($0, conditions: []) }
+            let swiftTarget = SwiftTarget(linuxMain: linuxMain, name: product.name, dependencies: dependencies)
+            return ResolvedTarget(target: swiftTarget, dependencies: targets.map { .target($0, conditions: []) })
         })
     }
 
     public var description: String {
         return "<ResolvedProduct: \(name)>"
     }
+
+    /// True if this product contains Swift targets.
+    public var containsSwiftTargets: Bool {
+      //  C targets can't import Swift targets in SwiftPM (at least not right
+      // now), so we can just look at the top-level targets.
+      //
+      // If that ever changes, we'll need to do something more complex here,
+      // recursively checking dependencies for SwiftTargets, and considering
+      // dynamic library targets to be Swift targets (since the dylib could
+      // contain Swift code we don't know about as part of this build).
+      return targets.contains { $0.underlyingTarget is SwiftTarget }
+    }
 }
 
-extension ResolvedTarget.Dependency: Hashable, CustomStringConvertible {
+extension ResolvedTarget.Dependency: CustomStringConvertible {
 
-    /// Returns the dependencies of the underlying dependency.
+    /// Returns the direct dependencies of the underlying dependency, accross the package graph.
     public var dependencies: [ResolvedTarget.Dependency] {
         switch self {
-        case .target(let target):
+        case .target(let target, _):
             return target.dependencies
-        case .product(let product):
-            return product.targets.map(ResolvedTarget.Dependency.target)
+        case .product(let product, _):
+            return product.targets.map { .target($0, conditions: []) }
         }
     }
 
-    // MARK: - Hashable, CustomStringConvertible conformance
-
-    public var hashValue: Int {
+    /// Returns the direct dependencies of the underlying dependency, limited to the target's package.
+    public var packageDependencies: [ResolvedTarget.Dependency] {
         switch self {
-            case .product(let p): return p.hashValue
-            case .target(let t): return t.hashValue
+        case .target(let target, _):
+            return target.dependencies
+        case .product:
+            return []
         }
     }
 
-    public static func == (lhs: ResolvedTarget.Dependency, rhs: ResolvedTarget.Dependency) -> Bool {
-        switch (lhs, rhs) {
-        case (.product(let l), .product(let r)):
-            return l == r
-        case (.product, _):
-            return false
-        case (.target(let l), .target(let r)):
-            return l == r
-        case (.target, _):
-            return false
-        }
-    }
+    // MARK: - CustomStringConvertible conformance
 
     public var description: String {
         var str = "<ResolvedTarget.Dependency: "
         switch self {
-        case .product(let p):
+        case .product(let p, _):
             str += p.description
-        case .target(let t):
+        case .target(let t, _):
             str += t.description
         }
         str += ">"

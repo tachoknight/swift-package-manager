@@ -11,8 +11,8 @@
 import Dispatch
 import class Foundation.OperationQueue
 
-import Basic
-import Utility
+import TSCBasic
+import TSCUtility
 
 /// Delegate to notify clients about actions being performed by RepositoryManager.
 public protocol RepositoryManagerDelegate: class {
@@ -39,7 +39,7 @@ public extension RepositoryManagerDelegate {
 /// Manages a collection of bare repositories.
 public class RepositoryManager {
 
-    public typealias LookupResult = Result<RepositoryHandle, AnyError>
+    public typealias LookupResult = Result<RepositoryHandle, Error>
     public typealias LookupCompletion = (LookupResult) -> Void
 
     /// Handle to a managed repository.
@@ -130,17 +130,17 @@ public class RepositoryManager {
     public let provider: RepositoryProvider
 
     /// The delegate interface.
-    private let delegate: RepositoryManagerDelegate
+    private let delegate: RepositoryManagerDelegate?
 
-    /// The map of registered repositories.
-    //
     // FIXME: We should use a more sophisticated map here, which tracks the
     // full specifier but then is capable of efficiently determining if two
     // repositories map to the same location.
+    //
+    /// The map of registered repositories.
     fileprivate var repositories: [String: RepositoryHandle] = [:]
 
     /// The map of serialized repositories.
-    /// 
+    ///
     /// NOTE: This is to be used only for persistence support.
     fileprivate var serializedRepositories: [String: JSON] = [:]
 
@@ -157,7 +157,7 @@ public class RepositoryManager {
     private let operationQueue: OperationQueue
 
     /// The filesystem to operate on.
-    private var fileSystem: FileSystem
+    public let fileSystem: FileSystem
 
     /// Simple persistence helper.
     private let persistence: SimplePersistence
@@ -174,7 +174,7 @@ public class RepositoryManager {
     public init(
         path: AbsolutePath,
         provider: RepositoryProvider,
-        delegate: RepositoryManagerDelegate,
+        delegate: RepositoryManagerDelegate? = nil,
         fileSystem: FileSystem = localFileSystem
     ) {
         self.path = path
@@ -230,7 +230,7 @@ public class RepositoryManager {
 
                 switch handle.status {
                 case .available:
-                    result = LookupResult(anyError: {
+                    result = LookupResult(catching: {
                         // Update the repository when it is being looked up.
                         let repo = try handle.open()
 
@@ -240,13 +240,13 @@ public class RepositoryManager {
                         }
 
                         self.callbacksQueue.async {
-                            self.delegate.handleWillUpdate(handle: handle)
+                            self.delegate?.handleWillUpdate(handle: handle)
                         }
 
                         try repo.fetch()
 
                         self.callbacksQueue.async {
-                            self.delegate.handleDidUpdate(handle: handle)
+                            self.delegate?.handleDidUpdate(handle: handle)
                         }
 
                         return handle
@@ -261,7 +261,7 @@ public class RepositoryManager {
 
                     // Inform delegate.
                     self.callbacksQueue.async {
-                        self.delegate.fetchingWillBegin(handle: handle)
+                        self.delegate?.fetchingWillBegin(handle: handle)
                     }
 
                     // Fetch the repo.
@@ -271,16 +271,16 @@ public class RepositoryManager {
                         try self.provider.fetch(repository: handle.repository, to: repositoryPath)
                         // Update status to available.
                         handle.status = .available
-                        result = Result(handle)
+                        result = .success(handle)
                     } catch {
                         handle.status = .error
                         fetchError = error
-                        result = Result(error)
+                        result = .failure(error)
                     }
 
                     // Inform delegate.
                     self.callbacksQueue.async {
-                        self.delegate.fetchingDidFinish(handle: handle, error: fetchError)
+                        self.delegate?.fetchingDidFinish(handle: handle, error: fetchError)
                     }
 
                     // Save the manager state.
@@ -307,9 +307,16 @@ public class RepositoryManager {
     }
 
     /// Returns the handle for repository if available, otherwise creates a new one.
+    ///
     /// Note: This method is thread safe.
     private func getHandle(repository: RepositorySpecifier) -> RepositoryHandle {
         return serialQueue.sync {
+
+            // Reset if the state file was deleted during the lifetime of RepositoryManager.
+            if !self.serializedRepositories.isEmpty && !self.persistence.stateFileExists() {
+                self.unsafeReset()
+            }
+
             let handle: RepositoryHandle
             if let oldHandle = self.repositories[repository.url] {
                 handle = oldHandle
@@ -350,6 +357,7 @@ public class RepositoryManager {
                 return
             }
             repositories[repository.url] = nil
+            serializedRepositories[repository.url] = nil
             let repositoryPath = path.appending(handle.subpath)
             try fileSystem.removeFileTree(repositoryPath)
             try self.persistence.saveState(self)
@@ -361,9 +369,15 @@ public class RepositoryManager {
     /// Note: This also removes the cloned repositories from the disk.
     public func reset() {
         serialQueue.sync {
-            self.repositories = [:]
-            try? self.fileSystem.removeFileTree(path)
+            self.unsafeReset()
         }
+    }
+
+    /// Performs the reset operation without the serial queue.
+    private func unsafeReset() {
+        self.repositories = [:]
+        self.serializedRepositories = [:]
+        try? self.fileSystem.removeFileTree(path)
     }
 }
 
@@ -376,9 +390,9 @@ extension RepositoryManager: SimplePersistanceProtocol {
         // We will use this to save the state so we don't have to read the other
         // handles when saving the sate of a handle.
         self.serializedRepositories = try json.get("repositories")
-        self.repositories = try Dictionary(items: serializedRepositories.map({
-            try ($0.0, RepositoryHandle(manager: self, json: $0.1))
-        }))
+        self.repositories = try serializedRepositories.mapValues({
+            try RepositoryHandle(manager: self, json: $0)
+        })
     }
 
     public func toJSON() -> JSON {
@@ -388,6 +402,6 @@ extension RepositoryManager: SimplePersistanceProtocol {
 
 extension RepositoryManager.RepositoryHandle: CustomStringConvertible {
     public var description: String {
-        return "<\(type(of: self)) subpath:\(subpath.asString)>"
+        return "<\(type(of: self)) subpath:\(subpath)>"
     }
 }

@@ -10,12 +10,13 @@
 
 import XCTest
 
-import Basic
-import Utility
-import TestSupport
+import TSCBasic
+import TSCUtility
+import SPMTestSupport
 import Commands
 import PackageModel
 import SourceControl
+import Workspace
 
 class ToolsVersionTests: XCTestCase {
 
@@ -31,9 +32,17 @@ class ToolsVersionTests: XCTestCase {
 
             try fs.writeFileContents(depPath.appending(component: "Package.swift")) {
                 $0 <<< """
-                    // swift-tools-version:3.1
+                    // swift-tools-version:5.0
                     import PackageDescription
-                    let package = Package(name: "Dep")
+                    let package = Package(
+                        name: "Dep",
+                        products: [
+                            .library(name: "Dep", targets: ["Dep"]),
+                        ],
+                        targets: [
+                            .target(name: "Dep", path: "./")
+                        ]
+                    )
                     """
             }
             try fs.writeFileContents(depPath.appending(component: "foo.swift")) {
@@ -78,23 +87,23 @@ class ToolsVersionTests: XCTestCase {
                     """
             }
             _ = try SwiftPMProduct.SwiftPackage.execute(
-                ["tools-version", "--set-current"], packagePath: primaryPath).chomp()
+                ["tools-version", "--set", "4.2"], packagePath: primaryPath).stdout.spm_chomp()
 
             // Build the primary package.
             _ = try SwiftPMProduct.SwiftBuild.execute([], packagePath: primaryPath)
-            let exe = primaryPath.appending(components: ".build", Destination.host.target, "debug", "Primary").asString
+            let exe = primaryPath.appending(components: ".build", Resources.default.toolchain.triple.tripleString, "debug", "Primary").pathString
             // v1 should get selected because v1.0.1 depends on a (way) higher set of tools.
-            XCTAssertEqual(try Process.checkNonZeroExit(args: exe).chomp(), "foo@1.0")
+            XCTAssertEqual(try Process.checkNonZeroExit(args: exe).spm_chomp(), "foo@1.0")
 
             // Set the tools version to something high.
             _ = try SwiftPMProduct.SwiftPackage.execute(
-                ["tools-version", "--set", "10000.1"], packagePath: primaryPath).chomp()
+                ["tools-version", "--set", "10000.1"], packagePath: primaryPath)
 
             do {
                 _ = try SwiftPMProduct.SwiftBuild.execute([], packagePath: primaryPath)
                 XCTFail()
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
-                XCTAssert(stderr.contains("equires a minimum Swift tools version of 10000.1.0 (currently 4.0.0)"))
+                XCTAssert(stderr.contains("is using Swift tools version 10000.1.0 but the installed version is \(ToolsVersion.currentToolsVersion)"), stderr)
             }
 
             // Write the manifest with incompatible sources.
@@ -105,19 +114,17 @@ class ToolsVersionTests: XCTestCase {
                         name: "Primary",
                         dependencies: [.package(url: "../Dep", from: "1.0.0")],
                         targets: [.target(name: "Primary", dependencies: ["Dep"], path: ".")],
-                        swiftLanguageVersions: [1000])
+                        swiftLanguageVersions: [.version("1000")])
                     """
             }
             _ = try SwiftPMProduct.SwiftPackage.execute(
-                ["tools-version", "--set-current"], packagePath: primaryPath).chomp()
+                ["tools-version", "--set", "4.2"], packagePath: primaryPath).stdout.spm_chomp()
 
             do {
                 _ = try SwiftPMProduct.SwiftBuild.execute([], packagePath: primaryPath)
                 XCTFail()
             } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
-                XCTAssertTrue(
-                    stderr.contains("package 'Primary' not compatible with current tools version (") &&
-                    stderr.contains("); it supports: 1000\n"))
+                XCTAssertTrue(stderr.contains("package 'Primary' requires minimum Swift language version 1000 which is not supported by the current tools version (\(ToolsVersion.currentToolsVersion))"), stderr)
             }
 
              try fs.writeFileContents(primaryPath.appending(component: "Package.swift")) {
@@ -125,18 +132,14 @@ class ToolsVersionTests: XCTestCase {
                     import PackageDescription
                     let package = Package(
                         name: "Primary",
-                        dependencies: [.package(url: "../Dep", from: "1.0.0")], 
+                        dependencies: [.package(url: "../Dep", from: "1.0.0")],
                         targets: [.target(name: "Primary", dependencies: ["Dep"], path: ".")],
-                        swiftLanguageVersions: [\(ToolsVersion.currentToolsVersion.major), 1000])
+                        swiftLanguageVersions: [.version("\(ToolsVersion.currentToolsVersion.major)"), .version("1000")])
                     """
              }
              _ = try SwiftPMProduct.SwiftPackage.execute(
-                 ["tools-version", "--set-current"], packagePath: primaryPath).chomp()
+                 ["tools-version", "--set", "4.2"], packagePath: primaryPath).stdout.spm_chomp()
              _ = try SwiftPMProduct.SwiftBuild.execute([], packagePath: primaryPath)
         }
     }
-
-    static var allTests = [
-        ("testToolsVersion", testToolsVersion),
-    ]
 }

@@ -12,7 +12,7 @@
 import XCTest
 import func Darwin.C.exit
 
-/// A helper tool to get list of tests from a XCTest Bundle on OSX.
+/// A helper tool to get list of tests from a XCTest Bundle on macOS.
 ///
 /// Usage: swiftpm-xctest-helper <bundle_path> <output_file_path>
 /// bundle_path: Path to the XCTest bundle
@@ -54,7 +54,7 @@ func run() throws {
     var testCases = [[String: AnyObject]]()
 
     for case let testCaseSuite as XCTestSuite in suite.tests {
-        let testSuite: [[String: AnyObject]] = testCaseSuite.tests.flatMap({
+        let testSuite: [[String: AnyObject]] = testCaseSuite.tests.compactMap({
             guard case let testCaseSuite as XCTestSuite = $0 else { return nil }
             // Get the name of the XCTest subclass with its target name if possible.
             // If the subclass contains atleast one test get the name using reflection,
@@ -67,7 +67,7 @@ func run() throws {
             }
 
             // Collect the test methods.
-            let tests: [[String: String]] = testCaseSuite.tests.flatMap({ test in
+            let tests: [[String: String]] = testCaseSuite.tests.compactMap({ test in
                 guard case let test as XCTestCase = test else { return nil }
                 // Split the test description into an array. Description formats:
                 // `-[ClassName MethodName]`, `-[ClassName MethodNameAndReturnError:]`
@@ -135,7 +135,7 @@ do {
 #else
 
 import func Glibc.exit
-print("Only OSX supported.")
+print("Only macOS supported.")
 exit(1)
 
 #endif

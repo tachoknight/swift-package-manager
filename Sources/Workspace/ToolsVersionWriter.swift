@@ -8,17 +8,17 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
+import TSCBasic
 import PackageModel
 import PackageLoading
-import Utility
+import TSCUtility
 
 /// Write the given tools version at the given path.
 ///
 /// - Parameters:
 ///   - path: The path of the package.
 ///   - version: The version to write.
-public func writeToolsVersion(at path: AbsolutePath, version: ToolsVersion, fs: inout FileSystem) throws {
+public func writeToolsVersion(at path: AbsolutePath, version: ToolsVersion, fs: FileSystem) throws {
     let file = path.appending(component: Manifest.filename)
     assert(fs.isFile(file), "Tools version file not present")
 
@@ -39,7 +39,7 @@ public func writeToolsVersion(at path: AbsolutePath, version: ToolsVersion, fs: 
     try fs.writeFileContents(file, bytes: stream.bytes)
 }
 
-public extension ToolsVersion {
+extension ToolsVersion {
 
     /// Returns the tools version with zeroed patch number.
     public var zeroedPatch: ToolsVersion {

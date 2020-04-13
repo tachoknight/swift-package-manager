@@ -10,16 +10,17 @@
 
 import XCTest
 import Commands
-import TestSupport
-import Basic
-import Utility
+import SPMTestSupport
+import TSCBasic
+import TSCUtility
+import Workspace
 
 class BuildPerfTests: XCTestCasePerf {
 
     @discardableResult
-    func execute(args: [String] = [], packagePath: AbsolutePath) throws -> String {
+    func execute(args: [String] = [], packagePath: AbsolutePath) throws -> (stdout: String, stderr: String) {
         // FIXME: We should pass the SWIFT_EXEC at lower level.
-        return try SwiftPMProduct.SwiftBuild.execute(args + [], packagePath: packagePath, env: ["SWIFT_EXEC": Resources.default.swiftCompiler.asString], printIfError: true)
+        return try SwiftPMProduct.SwiftBuild.execute(args + [], packagePath: packagePath, env: ["SWIFT_EXEC": Resources.default.swiftCompiler.pathString])
     }
 
     func clean(packagePath: AbsolutePath) throws {
@@ -27,25 +28,34 @@ class BuildPerfTests: XCTestCasePerf {
     }
 
     func testTrivialPackageFullBuild() {
+      #if os(macOS)
         runFullBuildTest(for: "DependencyResolution/Internal/Simple", product: "foo")
+      #endif
     }
 
     func testTrivialPackageNullBuild() {
+      #if os(macOS)
         runNullBuildTest(for: "DependencyResolution/Internal/Simple", product: "foo")
+      #endif
     }
 
     func testComplexPackageFullBuild() {
+      #if os(macOS)
         runFullBuildTest(for: "DependencyResolution/External/Complex", app: "app", product: "Dealer")
+      #endif
     }
 
     func testComplexPackageNullBuild() {
+      #if os(macOS)
         runNullBuildTest(for: "DependencyResolution/External/Complex", app: "app", product: "Dealer")
+      #endif
     }
 
     func runFullBuildTest(for name: String, app appString: String? = nil, product productString: String) {
         fixture(name: name) { prefix in
             let app = prefix.appending(components: (appString ?? ""))
-            let product = app.appending(components: ".build", Destination.host.target, "debug", productString)
+            let triple = Resources.default.toolchain.triple
+            let product = app.appending(components: ".build", triple.tripleString, "debug", productString)
             try self.execute(packagePath: app)
             measure {
                 try! self.clean(packagePath: app)
@@ -58,7 +68,8 @@ class BuildPerfTests: XCTestCasePerf {
     func runNullBuildTest(for name: String, app appString: String? = nil, product productString: String) {
         fixture(name: name) { prefix in
             let app = prefix.appending(components: (appString ?? ""))
-            let product = app.appending(components: ".build", Destination.host.target, "debug", productString)
+            let triple = Resources.default.toolchain.triple
+            let product = app.appending(components: ".build", triple.tripleString, "debug", productString)
             try self.execute(packagePath: app)
             measure {
                 try! self.execute(packagePath: app)

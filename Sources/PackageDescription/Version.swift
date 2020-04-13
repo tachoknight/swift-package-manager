@@ -1,146 +1,141 @@
 /*
  This source file is part of the Swift.org open source project
 
- Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+ Copyright (c) 2018 Apple Inc. and the Swift project authors
  Licensed under Apache License v2.0 with Runtime Library Exception
 
  See http://swift.org/LICENSE.txt for license information
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
-
- -------------------------------------------------------------------------
- [A semantic version](http://semver.org).
 */
 
-public struct Version {
-    public let (major, minor, patch): (Int, Int, Int)
-    public let prereleaseIdentifiers: [String]
-    public let buildMetadataIdentifier: String?
+/// A version according to the semantic versioning specification.
+///
+/// A package version is a three period-separated integer, for example `1.0.0`. It must conform to the semantic versioning standard in order to ensure
+/// that your package behaves in a predictable manner once developers update their
+/// package dependency to a newer version. To achieve predictability, the semantic versioning specification proposes a set of rules and
+/// requirements that dictate how version numbers are assigned and incremented. To learn more about the semantic versioning specification, visit
+/// [semver.org](www.semver.org).
+/// 
+/// **The Major Version**
+///
+/// The first digit of a version, or  *major version*, signifies breaking changes to the API that require
+/// updates to existing clients. For example, the semantic versioning specification
+/// considers renaming an existing type, removing a method, or changing a method's signature
+/// breaking changes. This also includes any backward-incompatible bug fixes or
+/// behavioral changes of the existing API.
+///
+/// **The Minor Version**
+//
+/// Update the second digit of a version, or *minor version*, if you add functionality in a backward-compatible manner.
+/// For example, the semantic versioning specification considers adding a new method
+/// or type without changing any other API to be backward-compatible.
+///
+/// **The Patch Version**
+///
+/// Increase the third digit of a version, or *patch version*, if you are making a backward-compatible bug fix.
+/// This allows clients to benefit from bugfixes to your package without incurring
+/// any maintenance burden.
+///
 
+public struct Version {
+
+    /// The major version according to the semantic versioning standard.
+    public let major: Int
+
+    /// The minor version according to the semantic versioning standard.
+    public let minor: Int
+
+    /// The patch version according to the semantic versioning standard.
+    public let patch: Int
+
+    /// The pre-release identifier according to the semantic versioning standard, such as `-beta.1`.
+    public let prereleaseIdentifiers: [String]
+
+    /// The build metadata of this version according to the semantic versioning standard, such as a commit hash.
+    public let buildMetadataIdentifiers: [String]
+
+    /// Initializes and returns a newly allocated version struct
+    /// for the provided components of a semantic version.
+    ///
+    /// - Parameters:
+    ///     - major: The major version numner.
+    ///     - minor: The minor version number.
+    ///     - patch: The patch version number.
+    ///     - prereleaseIdentifiers: The pre-release identifier.
+    ///     - buildMetaDataIdentifiers: Build metadata that identifies a build.
     public init(
         _ major: Int,
         _ minor: Int,
         _ patch: Int,
         prereleaseIdentifiers: [String] = [],
-        buildMetadataIdentifier: String? = nil
+        buildMetadataIdentifiers: [String] = []
     ) {
-        self.major = Swift.max(major, 0)
-        self.minor = Swift.max(minor, 0)
-        self.patch = Swift.max(patch, 0)
+        precondition(major >= 0 && minor >= 0 && patch >= 0, "Negative versioning is invalid.")
+        self.major = major
+        self.minor = minor
+        self.patch = patch
         self.prereleaseIdentifiers = prereleaseIdentifiers
-        self.buildMetadataIdentifier = buildMetadataIdentifier
+        self.buildMetadataIdentifiers = buildMetadataIdentifiers
     }
 }
-
-// MARK: Equatable
-
-extension Version: Equatable {
-    public static func == (v1: Version, v2: Version) -> Bool {
-        guard v1.major == v2.major && v1.minor == v2.minor && v1.patch == v2.patch else {
-            return false
-        }
-        
-        if v1.prereleaseIdentifiers != v2.prereleaseIdentifiers {
-            return false
-        }
-        
-        return v1.buildMetadataIdentifier == v2.buildMetadataIdentifier
-    }
-}
-
-// MARK: Hashable
-
-extension Version: Hashable {
-    public var hashValue: Int {
-        // FIXME: We need Swift hashing utilities; this is based on CityHash
-        // inspired code inside the Swift stdlib.
-        let mul: UInt64 = 0x9ddfea08eb382d69
-        var result: UInt64 = 0
-        result = (result &* mul) ^ UInt64(bitPattern: Int64(major.hashValue))
-        result = (result &* mul) ^ UInt64(bitPattern: Int64(minor.hashValue))
-        result = (result &* mul) ^ UInt64(bitPattern: Int64(patch.hashValue))
-        result = prereleaseIdentifiers.reduce(result, { ($0 &* mul) ^ UInt64(bitPattern: Int64($1.hashValue)) })
-        if let build = buildMetadataIdentifier {
-            result = (result &* mul) ^ UInt64(bitPattern: Int64(build.hashValue))
-        }
-        return Int(truncatingIfNeeded: result)
-    }
-}
-
-// MARK: Comparable
 
 extension Version: Comparable {
     public static func < (lhs: Version, rhs: Version) -> Bool {
         let lhsComparators = [lhs.major, lhs.minor, lhs.patch]
         let rhsComparators = [rhs.major, rhs.minor, rhs.patch]
-        
+
         if lhsComparators != rhsComparators {
             return lhsComparators.lexicographicallyPrecedes(rhsComparators)
         }
-        
+
         guard lhs.prereleaseIdentifiers.count > 0 else {
             return false // Non-prerelease lhs >= potentially prerelease rhs
         }
-        
+
         guard rhs.prereleaseIdentifiers.count > 0 else {
-            return true // Prerelease lhs < non-prerelease rhs
+            return true // Prerelease lhs < non-prerelease rhs 
         }
-        
+
         let zippedIdentifiers = zip(lhs.prereleaseIdentifiers, rhs.prereleaseIdentifiers)
         for (lhsPrereleaseIdentifier, rhsPrereleaseIdentifier) in zippedIdentifiers {
             if lhsPrereleaseIdentifier == rhsPrereleaseIdentifier {
                 continue
             }
-            
+
             let typedLhsIdentifier: Any = Int(lhsPrereleaseIdentifier) ?? lhsPrereleaseIdentifier
             let typedRhsIdentifier: Any = Int(rhsPrereleaseIdentifier) ?? rhsPrereleaseIdentifier
-            
+
             switch (typedLhsIdentifier, typedRhsIdentifier) {
-            case let (int1 as Int, int2 as Int): return int1 < int2
-            case let (string1 as String, string2 as String): return string1 < string2
-            case (is Int, is String): return true // Int prereleases < String prereleases
-            case (is String, is Int): return false
+                case let (int1 as Int, int2 as Int): return int1 < int2
+                case let (string1 as String, string2 as String): return string1 < string2
+                case (is Int, is String): return true // Int prereleases < String prereleases
+                case (is String, is Int): return false
             default:
                 return false
             }
         }
-        
+
         return lhs.prereleaseIdentifiers.count < rhs.prereleaseIdentifiers.count
     }
 }
 
-// MARK: BidirectionalIndexType
-
-// FIXME: do we want to keep these APIs now that Version does not conform to
-// BidirectionalCollection?
-extension Version {
-    public func successor() -> Version {
-        return Version(major, minor, patch + 1)
-    }
-
-    public func predecessor() -> Version {
-        if patch == 0 {
-            if minor == 0 {
-                return Version(major - 1, Int.max, Int.max)
-            } else {
-                return Version(major, minor - 1, Int.max)
-            }
-        } else {
-            return Version(major, minor, patch - 1)
+extension Version: CustomStringConvertible {
+    /// A textual description of the version object.
+    public var description: String {
+        var base = "\(major).\(minor).\(patch)"
+        if !prereleaseIdentifiers.isEmpty {
+            base += "-" + prereleaseIdentifiers.joined(separator: ".")
         }
+        if !buildMetadataIdentifiers.isEmpty {
+            base += "+" + buildMetadataIdentifiers.joined(separator: ".")
+        }
+        return base
     }
 }
 
-// MARK: CustomStringConvertible
-
-extension Version: CustomStringConvertible {
-    public var description: String {
-        var base = "\(major).\(minor).\(patch)"
-        if prereleaseIdentifiers.count > 0 {
-            base += "-" + prereleaseIdentifiers.joined(separator: ".")
-        }
-        if let buildMetadataIdentifier = buildMetadataIdentifier {
-            base += "+" + buildMetadataIdentifier
-        }
-        return base
+extension Version: Encodable {
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(description)
     }
 }

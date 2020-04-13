@@ -1,18 +1,17 @@
 /*
  This source file is part of the Swift.org open source project
- 
+
  Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
  Licensed under Apache License v2.0 with Runtime Library Exception
- 
+
  See http://swift.org/LICENSE.txt for license information
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
  */
 
-import Basic
-import Utility
+import TSCBasic
+import TSCUtility
 
 import PackageModel
-import PackageDescription4
 import SourceControl
 
 /// Represents the input to the package graph root.
@@ -36,10 +35,12 @@ public struct PackageGraphRootInput {
 /// Represents the inputs to the package graph.
 public struct PackageGraphRoot {
 
+    // FIXME: We can kill this now.
+    //
     /// Represents a top level package dependencies.
     public struct PackageDependency {
 
-        public typealias Requirement = PackageDescription4.Package.Dependency.Requirement
+        public typealias Requirement = PackageModel.PackageDependencyDescription.Requirement
 
         // Location of this dependency.
         //
@@ -55,10 +56,12 @@ public struct PackageGraphRoot {
         public let requirement: Requirement
 
         /// Create the package reference object for the dependency.
-        public func createPackageRef() -> PackageReference {
+        public func createPackageRef(config: SwiftPMConfig) -> PackageReference {
+            let effectiveURL = config.mirroredURL(forURL: self.url)
             return PackageReference(
-                identity: PackageReference.computeIdentity(packageURL: url),
-                path: url
+                identity: PackageReference.computeIdentity(packageURL: effectiveURL),
+                path: effectiveURL,
+                kind: requirement == .localPackage ? .local : .remote
             )
         }
 
@@ -71,7 +74,7 @@ public struct PackageGraphRoot {
             // strip that. We need to design a URL data structure for SwiftPM.
             let filePrefix = "file://"
             if url.hasPrefix(filePrefix) {
-                self.url = AbsolutePath(String(url.dropFirst(filePrefix.count))).asString
+                self.url = AbsolutePath(String(url.dropFirst(filePrefix.count))).pathString
             } else {
                 self.url = url
             }
@@ -92,47 +95,50 @@ public struct PackageGraphRoot {
     /// Create a package graph root.
     public init(input: PackageGraphRootInput, manifests: [Manifest]) {
         self.packageRefs = zip(input.packages, manifests).map { (path, manifest) in
-            PackageReference(identity: manifest.name.lowercased(), path: path.asString, isLocal: true)
+            let identity = PackageReference.computeIdentity(packageURL: manifest.url)
+            return PackageReference(identity: identity, path: path.pathString, kind: .root)
         }
         self.manifests = manifests
         self.dependencies = input.dependencies
     }
 
     /// Returns the constraints imposed by root manifests + dependencies.
-    public var constraints: [RepositoryPackageConstraint] {
+    public func constraints(config: SwiftPMConfig) -> [RepositoryPackageConstraint] {
         let constraints = packageRefs.map({
             RepositoryPackageConstraint(container: $0, requirement: .unversioned)
         })
         return constraints + dependencies.map({
             RepositoryPackageConstraint(
-                container: $0.createPackageRef(),
+                container: $0.createPackageRef(config: config),
                 requirement: $0.requirement.toConstraintRequirement()
             )
         })
     }
 }
 
-extension PackageDescription4.Package.Dependency.Requirement {
+extension PackageDependencyDescription.Requirement {
 
     /// Returns the constraint requirement representation.
-    public func toConstraintRequirement() -> RepositoryPackageConstraint.Requirement {
+    public func toConstraintRequirement() -> PackageRequirement {
         switch self {
-        case .rangeItem(let range):
-            return .versionSet(.range(range.asUtilityVersion))
+        case .range(let range):
+            return .versionSet(.range(range))
 
-        case .revisionItem(let identifier):
-            assert(identifier.count == 40)
+        case .revision(let identifier):
             assert(Git.checkRefFormat(ref: identifier))
 
             return .revision(identifier)
 
-        case .branchItem(let identifier):
+        case .branch(let identifier):
             assert(Git.checkRefFormat(ref: identifier))
 
             return .revision(identifier)
 
-        case .exactItem(let version):
-            return .versionSet(.exact(Version(pdVersion: version)))
+        case .exact(let version):
+            return .versionSet(.exact(version))
+
+        case .localPackage:
+            return .unversioned
         }
     }
 }

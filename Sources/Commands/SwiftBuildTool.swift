@@ -8,26 +8,11 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Build
-import Utility
-import Basic
+import TSCUtility
+import TSCBasic
 import PackageGraph
-
-//FIXME: Can we move this functionality into the argument parser?
-/// Diagnostic error when a command is run with several arguments that are mutually exclusive.
-struct MutuallyExclusiveArgumentsDiagnostic: DiagnosticData {
-    static let id = DiagnosticID(
-        type: MutuallyExclusiveArgumentsDiagnostic.self,
-        name: "org.swift.diags.mutually-exclusive-arguments",
-        defaultBehavior: .error,
-        description: {
-            $0 <<< { $0.arguments.map({ "'\($0)'" }).localizedJoin(type: .conjunction) }
-            $0 <<< "are mutually exclusive"
-        }
-    )
-
-    let arguments: [String]
-}
+import SPMBuildCore
+import Build
 
 /// swift-build tool namespace
 public class SwiftBuildTool: SwiftTool<BuildToolOptions> {
@@ -52,11 +37,11 @@ public class SwiftBuildTool: SwiftTool<BuildToolOptions> {
           #endif
 
             guard let subset = options.buildSubset(diagnostics: diagnostics) else { return }
-            let plan = try buildPlan()
-            try build(plan: plan, subset: subset)
+            let buildSystem = try createBuildSystem()
+            try buildSystem.build(subset: subset)
 
         case .binPath:
-            try print(buildParameters().buildPath.asString)
+            try print(buildParameters().buildPath.description)
 
         case .version:
             print(Versioning.currentVersion.completeDisplayString)
@@ -87,14 +72,14 @@ public class SwiftBuildTool: SwiftTool<BuildToolOptions> {
 
     private func checkClangVersion() {
         // We only care about this on Ubuntu 14.04
-        guard let uname = try? Process.checkNonZeroExit(args: "lsb_release", "-r").chomp(),
+        guard let uname = try? Process.checkNonZeroExit(args: "lsb_release", "-r").spm_chomp(),
               uname.hasSuffix("14.04"),
-              let clangVersionOutput = try? Process.checkNonZeroExit(args: "clang", "--version").chomp(),
+              let clangVersionOutput = try? Process.checkNonZeroExit(args: "clang", "--version").spm_chomp(),
               let clang = getClangVersion(versionOutput: clangVersionOutput) else {
             return
         }
 
-        if clang.major <= 3 && clang.minor < 6 {
+        if clang < Version(3, 6, 0) {
             print("warning: minimum recommended clang is version 3.6, otherwise you may encounter linker errors.")
         }
     }
@@ -130,7 +115,7 @@ public class BuildToolOptions: ToolOptions {
         }
 
         guard allSubsets.count < 2 else {
-            diagnostics.emit(data: MutuallyExclusiveArgumentsDiagnostic(arguments: allSubsets.map({ $0.argumentName })))
+            diagnostics.emit(.mutuallyExclusiveArgumentsError(arguments: allSubsets.map{ $0.argumentName }))
             return nil
         }
 
@@ -183,5 +168,13 @@ fileprivate extension BuildSubset {
 extension SwiftBuildTool: ToolName {
     static var toolName: String {
         return "swift build"
+    }
+}
+
+extension Diagnostic.Message {
+    //FIXME: Can we move this functionality into the argument parser?
+    /// Diagnostic error when a command is run with several arguments that are mutually exclusive.
+    static func mutuallyExclusiveArgumentsError(arguments: [String]) -> Diagnostic.Message {
+        .error(arguments.map{ "'\($0)'" }.spm_localizedJoin(type: .conjunction) + " are mutually exclusive")
     }
 }

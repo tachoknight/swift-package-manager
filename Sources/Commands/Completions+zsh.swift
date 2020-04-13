@@ -9,8 +9,8 @@
 */
 
 import Foundation
-import Basic
-import Utility
+import TSCBasic
+import TSCUtility
 
 /// Template for ZSH completion script.
 ///

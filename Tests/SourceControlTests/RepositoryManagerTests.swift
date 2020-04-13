@@ -10,12 +10,10 @@
 
 import XCTest
 
-import Basic
+import TSCBasic
 import SourceControl
 
-import TestSupport
-
-@testable import class SourceControl.RepositoryManager
+import SPMTestSupport
 
 extension RepositoryManager {
     fileprivate func lookupSynchronously(repository: RepositorySpecifier) throws -> RepositoryHandle {
@@ -75,7 +73,8 @@ private class DummyRepositoryProvider: RepositoryProvider {
     
     func fetch(repository: RepositorySpecifier, to path: AbsolutePath) throws {
         assert(!localFileSystem.exists(path))
-        try! localFileSystem.writeFileContents(path, bytes: ByteString(encodingAsUTF8: repository.url))
+        try localFileSystem.createDirectory(path.parentDirectory, recursive: true)
+        try localFileSystem.writeFileContents(path, bytes: ByteString(encodingAsUTF8: repository.url))
 
         numClones += 1
         
@@ -93,6 +92,10 @@ private class DummyRepositoryProvider: RepositoryProvider {
     func cloneCheckout(repository: RepositorySpecifier, at sourcePath: AbsolutePath, to destinationPath: AbsolutePath, editable: Bool) throws {
         try localFileSystem.createDirectory(destinationPath)
         try localFileSystem.writeFileContents(destinationPath.appending(component: "README.txt"), bytes: "Hi")
+    }
+
+    func checkoutExists(at path: AbsolutePath) throws -> Bool {
+        return false
     }
 
     func openCheckout(at path: AbsolutePath) throws -> WorkingCheckout {
@@ -192,7 +195,7 @@ class RepositoryManagerTests: XCTestCase {
                     XCTFail("Unexpected success")
                     return
                 }
-                XCTAssertEqual(error.underlyingError as? DummyError, DummyError.invalidRepository)
+                XCTAssertEqual(error as? DummyError, DummyError.invalidRepository)
                 badLookupExpectation.fulfill()
             }
 
@@ -213,6 +216,14 @@ class RepositoryManagerTests: XCTestCase {
 
             // Remove the repo.
             try manager.remove(repository: dummyRepo)
+
+            // Check removing the repo updates the persistent file.
+            do {
+                let checkoutsStateFile = path.appending(component: "checkouts-state.json")
+                let jsonData = try JSON(bytes: localFileSystem.readFileContents(checkoutsStateFile))
+                XCTAssertEqual(jsonData.dictionary?["object"]?.dictionary?["repositories"]?.dictionary?[dummyRepo.url], nil)
+            }
+
             // We should get a new handle now because we deleted the exisiting repository.
             XCTNonNil(prevHandle) {
                 try XCTAssert($0 !== manager.lookupSynchronously(repository: dummyRepo))
@@ -237,7 +248,7 @@ class RepositoryManagerTests: XCTestCase {
             XCTAssertEqual(delegate.willFetch.count, 1)
             XCTAssertEqual(delegate.didFetch.count, 1)
             manager.reset()
-            XCTAssertTrue(!isDirectory(repos))
+            XCTAssertTrue(!localFileSystem.isDirectory(repos))
             try localFileSystem.createDirectory(repos, recursive: true)
             _ = try manager.lookupSynchronously(repository: dummyRepo)
             XCTAssertEqual(delegate.willFetch.count, 2)
@@ -282,7 +293,7 @@ class RepositoryManagerTests: XCTestCase {
             do {
                 let delegate = DummyRepositoryManagerDelegate()
                 var manager = RepositoryManager(path: path, provider: provider, delegate: delegate)
-                try! removeFileTree(path.appending(component: "checkouts-state.json"))
+                try! localFileSystem.removeFileTree(path.appending(component: "checkouts-state.json"))
                 manager = RepositoryManager(path: path, provider: provider, delegate: delegate)
                 let dummyRepo = RepositorySpecifier(url: "dummy")
 
@@ -361,11 +372,33 @@ class RepositoryManagerTests: XCTestCase {
         }
     }
 
-    static var allTests = [
-        ("testBasics", testBasics),
-        ("testParallelLookups", testParallelLookups),
-        ("testPersistence", testPersistence),
-        ("testReset", testReset),
-        ("testSkipUpdate", testSkipUpdate),
-    ]
+    func testStateFileResilience() throws {
+        mktmpdir { path in
+            // Setup a dummy repository.
+            let repos = path.appending(component: "repo")
+            let provider = DummyRepositoryProvider()
+            let delegate = DummyRepositoryManagerDelegate()
+            try localFileSystem.createDirectory(repos, recursive: true)
+            let manager = RepositoryManager(path: repos, provider: provider, delegate: delegate)
+            let dummyRepo = RepositorySpecifier(url: "dummy")
+
+            // Perform a lookup.
+            _ = try manager.lookupSynchronously(repository: dummyRepo)
+            XCTAssertEqual(delegate.didFetch.count, 1)
+
+            // Delete the checkout state file.
+            let stateFile = repos.appending(component: "checkouts-state.json")
+            try localFileSystem.removeFileTree(stateFile)
+
+            // We should refetch the repository since we lost the state file.
+            _ = try manager.lookupSynchronously(repository: dummyRepo)
+            XCTAssertEqual(delegate.didFetch.count, 2)
+
+            // This time remove the entire repository directory and expect that
+            // to work as well.
+            try localFileSystem.removeFileTree(repos)
+            _ = try manager.lookupSynchronously(repository: dummyRepo)
+            XCTAssertEqual(delegate.didFetch.count, 3)
+        }
+    }
 }

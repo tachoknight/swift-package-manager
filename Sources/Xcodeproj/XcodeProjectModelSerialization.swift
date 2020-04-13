@@ -47,9 +47,10 @@ extension Xcode.Project: PropertyListSerializable {
         dict["isa"] = .string("PBXProject")
         // Since the project file is generated, we opt out of upgrade-checking.
         // FIXME: Shoule we really?  Why would we not want to get upgraded?
-        dict["attributes"] = .dictionary(["LastUpgradeCheck": .string("9999")])
+        dict["attributes"] = .dictionary(["LastUpgradeCheck": .string("9999"),
+                                          "LastSwiftMigration": .string("9999")])
         dict["compatibilityVersion"] = .string("Xcode 3.2")
-        dict["developmentRegion"] = .string("English")
+        dict["developmentRegion"] = .string("en")
         // Build settings are a bit tricky; in Xcode, each is stored in a named
         // XCBuildConfiguration object, and the list of build configurations is
         // in turn stored in an XCConfigurationList.  In our simplified model,
@@ -89,7 +90,7 @@ fileprivate func makeReferenceDict(
     if let name = reference.name {
         dict["name"] = .string(name)
     }
-    dict["sourceTree"] = .string(reference.pathBase.asString)
+    dict["sourceTree"] = .string(reference.pathBase.rawValue)
     return dict
 }
 
@@ -177,7 +178,7 @@ extension Xcode.Target: PropertyListSerializable {
         }))
         dict["productName"] = .string(productName)
         if let productType = productType {
-            dict["productType"] = .string(productType.asString)
+            dict["productType"] = .string(productType.rawValue)
         }
         if let productReference = productReference {
             dict["productReference"] = .identifier(serializer.id(of: productReference))
@@ -286,6 +287,12 @@ extension Xcode.BuildFile: PropertyListSerializable {
         if let fileRef = fileRef {
             dict["fileRef"] = .identifier(serializer.id(of: fileRef))
         }
+
+        let settingsDict = settings.asPropertyList()
+        if !settingsDict.isEmpty {
+            dict["settings"] = settingsDict
+        }
+
         return dict
     }
 }
@@ -354,13 +361,18 @@ extension Xcode.BuildSettingsTable: PropertyListSerializable {
         // FIXME: What is this, and why are we setting it?
         dict["defaultConfigurationIsVisible"] = .string("0")
         // FIXME: Should we allow this to be set in the model?
-        dict["defaultConfigurationName"] = .string("Debug")
+        dict["defaultConfigurationName"] = .string("Release")
         return dict
     }
 }
 
-extension Xcode.BuildSettingsTable.BuildSettings {
+public protocol PropertyListDictionaryConvertible {
+    func asPropertyList() -> PropertyList
+}
 
+extension PropertyListDictionaryConvertible {
+    // FIXME: Internal only for unit testing.
+    //
     /// Returns a property list representation of the build settings, in which
     /// every struct field is represented as a dictionary entry.  Fields of
     /// type `String` are represented as `PropertyList.string` values; fields
@@ -372,8 +384,7 @@ extension Xcode.BuildSettingsTable.BuildSettings {
     /// applies to classes.  Creating a property list representation is totally
     /// independent of that serialization infrastructure (though it might well
     /// be invoked during of serialization of actual model objects).
-    // FIXME: Internal only for unit testing.
-    func asPropertyList() -> PropertyList {
+    public func asPropertyList() -> PropertyList {
         // Borderline hacky, but the main thing is that adding or changing a
         // build setting does not require any changes to the property list
         // representation code.  Using a handcoded serializer might be more
@@ -387,32 +398,25 @@ extension Xcode.BuildSettingsTable.BuildSettings {
                 preconditionFailure("unnamed build settings are not supported")
             }
             switch child.value {
-              case nil:
+            case Optional<Any>.none:
                 continue
-              case let value as String:
+            case let value as String:
                 dict[name] = .string(value)
-              case let value as [String]:
+            case let value as [String]:
                 dict[name] = .array(value.map({ .string($0) }))
-              default:
-                // FIXME: I haven't found a way of distinguishing a value of an
-                // unexpected type from a value that is nil; they all seem to go
-                // throught the `default` case instead of the `nil` case above.
-                // Hopefully someone reading this will clue me in about what I
-                // did wrong.  But currently we will silently fail to serialize
-                // any struct field that isn't a `String` or a `[String]` (or
-                // an optional of either of those two).
-                // This would only come up if a field were to be added of a type
-                // other than `String` or `[String]`.
-                continue
+            default:
+                preconditionFailure("unexpected build setting value of type `\(type(of: child.value))`")
             }
         }
         return .dictionary(dict)
     }
 }
 
+extension Xcode.BuildFile.Settings: PropertyListDictionaryConvertible {}
+extension Xcode.BuildSettingsTable.BuildSettings: PropertyListDictionaryConvertible {}
+
 /// Private helper function that combines a base property list and an overlay
 /// property list, respecting the semantics of `$(inherited)` as we go.
-/// FIXME:  This should possibly be done while constructing the property list.
 fileprivate func combineBuildSettingsPropertyLists(
     baseSettings: PropertyList,
     overlaySettings: PropertyList
@@ -428,10 +432,11 @@ fileprivate func combineBuildSettingsPropertyLists(
     // Iterate over the overlay values and apply them to the base.
     var resultDict = baseDict
     for (name, value) in overlayDict {
-        // FIXME: We should resolve `$(inherited)` here.  The way this works is
-        // that occurrences of `$(inherited)` in the overlay are replaced with
-        // the overlaid value in the base.
-        resultDict[name] = value
+        if let array = baseDict[name]?.array, let overlayArray = value.array, overlayArray.first?.string == "$(inherited)" {
+            resultDict[name] = .array(array + overlayArray.dropFirst())
+        } else {
+            resultDict[name] = value
+        }
     }
     return .dictionary(resultDict)
 }
@@ -452,8 +457,8 @@ fileprivate class PropertyListSerializer {
             self.object = object
         }
 
-        var hashValue: Int {
-            return ObjectIdentifier(object).hashValue
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(ObjectIdentifier(object))
         }
 
         static func == (lhs: SerializedObjectRef, rhs: SerializedObjectRef) -> Bool {
@@ -491,7 +496,8 @@ fileprivate class PropertyListSerializer {
     /// then adding that dictionary to the serializer.  This may in turn cause
     /// recursive invocations of `serialize(object:)`; the closure of these
     /// invocations end up serializing the whole object graph.
-    @discardableResult func serialize(object: PropertyListSerializable) -> String {
+    @discardableResult
+    func serialize(object: PropertyListSerializable) -> String {
         // Assign an id for the object, if it doesn't already have one.
         let id = self.id(of: object)
 
@@ -566,79 +572,13 @@ extension PropertyListSerializable {
     }
 }
 
-/// A very simple representation of a property list.  Note that the `identifier`
-/// enum is not strictly necessary, but useful to semantically distinguish the
-/// strings that represents object identifiers from those that are just data.
-public enum PropertyList {
-    case identifier(String)
-    case string(String)
-    case array([PropertyList])
-    case dictionary([String: PropertyList])
-}
-
-/// Private struct to generate indentation strings.
-fileprivate struct Indentation: CustomStringConvertible {
-    var level: Int = 0
-    mutating func increase() {
-        level += 1
-        precondition(level > 0, "indentation level overflow")
-    }
-    mutating func decrease() {
-        precondition(level > 0, "indentation level underflow")
-        level -= 1
-    }
-    var description: String {
-        return String(repeating: "   ", count: level)
-    }
-}
-
-/// Private function to generate OPENSTEP-style plist representation.
-fileprivate func generatePlistRepresentation(plist: PropertyList, indentation: Indentation) -> String {
-    // Do the appropriate thing for each type of plist node.
-    switch plist {
-
-      case .identifier(let ident):
-        // FIXME: we should assert that the identifier doesn't need quoting
-        return ident
-
-      case .string(let string):
-        return "\"" + Plist.escape(string: string) + "\""
-
-      case .array(let array):
-        var indent = indentation
-        var str = "(\n"
-        indent.increase()
-        for item in array {
-            str += "\(indent)\(generatePlistRepresentation(plist: item, indentation: indent)),\n"
+extension PropertyList {
+    var isEmpty: Bool {
+        switch self {
+        case let .identifier(string): return string.isEmpty
+        case let .string(string): return string.isEmpty
+        case let .array(array): return array.isEmpty
+        case let .dictionary(dictionary): return dictionary.isEmpty
         }
-        indent.decrease()
-        str += "\(indent))"
-        return str
-
-      case .dictionary(let dict):
-        var indent = indentation
-        let dict = dict.sorted(by: {
-            // Make `isa` sort first (just for readability purposes).
-            switch ($0.key, $1.key) {
-              case ("isa", "isa"): return false
-              case ("isa", _): return true
-              case (_, "isa"): return false
-              default: return $0.key < $1.key
-            }
-        })
-        var str = "{\n"
-        indent.increase()
-        for item in dict {
-            str += "\(indent)\(item.key) = \(generatePlistRepresentation(plist: item.value, indentation: indent));\n"
-        }
-        indent.decrease()
-        str += "\(indent)}"
-        return str
-    }
-}
-
-extension PropertyList: CustomStringConvertible {
-    public var description: String {
-        return generatePlistRepresentation(plist: self, indentation: Indentation())
     }
 }

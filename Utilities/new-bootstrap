@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+set -eu
+
+__dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+exec ${__dir}/bootstrap "$@"

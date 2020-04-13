@@ -8,7 +8,7 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
+import TSCBasic
 import PackageModel
 
 enum DescribeMode: String {
@@ -34,20 +34,20 @@ extension Package: JSONSerializable {
     func describe(on stream: OutputByteStream) {
         stream <<< """
             Name: \(name)
-            Path: \(path.asString)
+            Path: \(path)
             Modules:\n
             """
-        for target in targets {
+        for target in targets.sorted(by: { $0.name > $1.name }) {
             target.describe(on: stream, indent: 4)
             stream <<< "\n"
         }
     }
 
     public func toJSON() -> JSON {
-        return .dictionary([
-            "name": .string(name),
-            "path": .string(path.asString),
-            "targets": .array(targets.map({ $0.toJSON() })),
+        return .init([
+            "name": name,
+            "path": path,
+            "targets": targets.sorted(by: { $0.name > $1.name }),
         ])
     }
 }
@@ -64,26 +64,26 @@ extension Target: JSONSerializable {
         stream <<< Format.asRepeating(string: " ", count: indent)
             <<< "Module type: " <<< String(describing: Swift.type(of: self)) <<< "\n"
         stream <<< Format.asRepeating(string: " ", count: indent)
-            <<< "Path: " <<< sources.root.asString <<< "\n"
+            <<< "Path: " <<< sources.root.pathString <<< "\n"
         stream <<< Format.asRepeating(string: " ", count: indent)
-            <<< "Sources: " <<< sources.relativePaths.map({ $0.asString }).joined(separator: ", ") <<< "\n"
+            <<< "Sources: " <<< sources.relativePaths.map({ $0.pathString }).joined(separator: ", ") <<< "\n"
     }
 
     public func toJSON() -> JSON {
-        return .dictionary([
-            "name": .string(name),
-            "c99name": .string(c99name),
-            "type": type.toJSON(),
-            "module_type": .string(String(describing: Swift.type(of: self))),
-            "path": .string(sources.root.asString),
-            "sources": sources.toJSON(),
+        return .init([
+            "name": name,
+            "c99name": c99name,
+            "type": type,
+            "module_type": String(describing: Swift.type(of: self)),
+            "path": sources.root,
+            "sources": sources
         ])
     }
 }
 
 extension Sources: JSONSerializable {
     public func toJSON() -> JSON {
-        return .array(relativePaths.map({ .string($0.asString) }))
+        return .array(relativePaths.map({ .string($0.pathString) }))
     }
 }
 

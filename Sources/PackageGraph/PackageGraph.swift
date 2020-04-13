@@ -8,7 +8,7 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
  */
 
-import Basic
+import TSCBasic
 import PackageModel
 
 /// A collection of packages.
@@ -30,7 +30,13 @@ public struct PackageGraph {
     public let allTargets: Set<ResolvedTarget>
  
     /// Returns all the products in the graph, regardless if they are reachable from the root targets or not.
-    public var allProducts: Set<ResolvedProduct>
+    public let allProducts: Set<ResolvedProduct>
+
+    /// The set of package dependencies required for a fully resolved graph.
+    ///
+    //// This set will also have references to packages that are currently present
+    /// in the graph due to loading errors. This set doesn't include the root packages.
+    public let requiredDependencies: Set<PackageReference>
 
     /// Returns true if a given target is present in root packages.
     public func isInRootPackages(_ target: ResolvedTarget) -> Bool {
@@ -38,10 +44,23 @@ public struct PackageGraph {
         return rootPackages.flatMap({ $0.targets }).contains(target)
     }
 
+    public func isRootPackage(_ package: ResolvedPackage) -> Bool {
+        // FIXME: This can be easily cached.
+        return rootPackages.contains(package)
+    }
+
+    /// All root and root dependency packages provided as input to the graph.
+    public let inputPackages: [ResolvedPackage]
+
     /// Construct a package graph directly.
-    public init(rootPackages: [ResolvedPackage], rootDependencies: [ResolvedPackage] = []) {
+    public init(
+        rootPackages: [ResolvedPackage],
+        rootDependencies: [ResolvedPackage] = [],
+        requiredDependencies: Set<PackageReference>
+    ) {
         self.rootPackages = rootPackages
-        let inputPackages = rootPackages + rootDependencies
+        self.requiredDependencies = requiredDependencies
+        self.inputPackages = rootPackages + rootDependencies
         self.packages = try! topologicalSort(inputPackages, successors: { $0.dependencies })
 
         allTargets = Set(packages.flatMap({ package -> [ResolvedTarget] in
@@ -64,25 +83,44 @@ public struct PackageGraph {
             }
         }))
 
-        // Compute the input targets.
-        let inputTargets = inputPackages.flatMap({ $0.targets }).map(ResolvedTarget.Dependency.target)
-        // Find all the dependencies of the root targets.
-        let dependencies = try! topologicalSort(inputTargets, successors: { $0.dependencies })
+        // Compute the reachable targets and products.
+        let inputTargets = inputPackages.flatMap { $0.targets }
+        let inputProducts = inputPackages.flatMap { $0.products }
+        let recursiveDependencies = inputTargets.lazy.flatMap { $0.recursiveDependencies() }
 
-        // Separate out the products and targets but maintain their topological order.
-        var reachableTargets: Set<ResolvedTarget> = []
-        var reachableProducts = Set(inputPackages.flatMap({ $0.products }))
+        self.reachableTargets = Set(inputTargets).union(recursiveDependencies.compactMap { $0.target })
+        self.reachableProducts = Set(inputProducts).union(recursiveDependencies.compactMap { $0.product })
+    }
 
-        for dependency in dependencies {
-            switch dependency {
-            case .target(let target):
-                reachableTargets.insert(target)
-            case .product(let product):
-                reachableProducts.insert(product)
-            }
+    /// Computes a map from each executable target in any of the root packages to the corresponding test targets.
+    public func computeTestTargetsForExecutableTargets() -> [ResolvedTarget: [ResolvedTarget]] {
+        var result = [ResolvedTarget: [ResolvedTarget]]()
+
+        let rootTargets = rootPackages.map({ $0.targets }).flatMap({ $0 })
+
+        // Create map of test target to set of its direct dependencies.
+        let testTargetDepMap: [ResolvedTarget: Set<ResolvedTarget>] = {
+            let testTargetDeps = rootTargets.filter({ $0.type == .test }).map({
+                ($0, Set($0.dependencies.compactMap({ $0.target })))
+            })
+            return Dictionary(uniqueKeysWithValues: testTargetDeps)
+        }()
+
+        for target in rootTargets where target.type == .executable {
+            // Find all dependencies of this target within its package.
+            let dependencies = try! topologicalSort(target.dependencies, successors: {
+                $0.dependencies.compactMap { $0.target }.map { .target($0, conditions: []) }
+            }).compactMap({ $0.target })
+
+            // Include the test targets whose dependencies intersect with the
+            // current target's (recursive) dependencies.
+            let testTargets = testTargetDepMap.filter({ (testTarget, deps) in
+                !deps.intersection(dependencies + [target]).isEmpty
+            }).map({ $0.key })
+
+            result[target] = testTargets
         }
 
-        self.reachableTargets = reachableTargets
-        self.reachableProducts = reachableProducts
+        return result
     }
 }

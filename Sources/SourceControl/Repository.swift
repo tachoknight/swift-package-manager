@@ -8,10 +8,10 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 */
 
-import Basic
+import TSCBasic
 
 /// Specifies a repository address.
-public struct RepositorySpecifier {
+public struct RepositorySpecifier: Hashable {
     /// The URL of the repository.
     public let url: String
 
@@ -25,21 +25,20 @@ public struct RepositorySpecifier {
     /// This identifier is suitable for use in a file system path, and
     /// unique for each repository.
     public var fileSystemIdentifier: String {
-        // FIXME: Need to do something better here. In particular, we should use
-        // a stable hash function since this interacts with the RepositoryManager
-        // persistence.
-        let basename = url.components(separatedBy: "/").last!
-        return basename + "-" + String(url.hashValue)
-    }
-}
+        // Use first 8 chars of a stable hash.
+        let hash = SHA256().hash(url).hexadecimalRepresentation
+        let suffix = hash.dropLast(hash.count - 8)
 
-extension RepositorySpecifier: Hashable {
-    public var hashValue: Int {
-        return url.hashValue
+        return basename + "-" + suffix
     }
-    
-    public static func == (lhs: RepositorySpecifier, rhs: RepositorySpecifier) -> Bool {
-        return lhs.url == rhs.url
+
+    /// Returns the cleaned basename for the specifier.
+    public var basename: String {
+        var basename = url.components(separatedBy: "/").last!
+        if basename.hasSuffix(".git") {
+            basename = String(basename.dropLast(4))
+        }
+        return basename
     }
 }
 
@@ -98,12 +97,21 @@ public protocol RepositoryProvider {
         to destinationPath: AbsolutePath,
         editable: Bool) throws
 
+    /// Returns true if a working repository exists at `path`
+    func checkoutExists(at path: AbsolutePath) throws -> Bool
+
     /// Open a working repository copy.
     ///
     /// - Parameters:
     ///   - path: The location of the repository on disk, at which the
     ///     repository has previously been created via `cloneCheckout`.
     func openCheckout(at path: AbsolutePath) throws -> WorkingCheckout
+}
+
+extension RepositoryProvider {
+    public func checkoutExists(at path: AbsolutePath) throws -> Bool {
+        fatalError("Unimplemented")
+    }
 }
 
 /// Abstract repository operations.
@@ -185,7 +193,7 @@ public protocol WorkingCheckout {
 
     /// This check for any modified state of the repository and returns true
     /// if there are uncommited changes.
-    func hasUncommitedChanges() -> Bool
+    func hasUncommittedChanges() -> Bool
 
     /// Check out the given tag.
     func checkout(tag: String) throws
@@ -200,6 +208,18 @@ public protocol WorkingCheckout {
     ///
     /// Note: It is an error to provide a branch name which already exists.
     func checkout(newBranch: String) throws
+
+    /// Returns true if there is an alternative store in the checkout and it is valid.
+    func isAlternateObjectStoreValid() -> Bool
+
+    /// Returns true if the file at `path` is ignored by `git`
+    func areIgnored(_ paths: [AbsolutePath]) throws -> [Bool]
+}
+
+extension WorkingCheckout {
+    public func areIgnored(_ paths: [AbsolutePath]) throws -> [Bool] {
+        fatalError("Unimplemented")
+    }
 }
 
 /// A single repository revision.
@@ -213,14 +233,6 @@ public struct Revision: Hashable {
 
     public init(identifier: String) {
         self.identifier = identifier
-    }
-
-    public var hashValue: Int {
-        return identifier.hashValue
-    }
-
-    public static func == (lhs: Revision, rhs: Revision) -> Bool {
-        return lhs.identifier == rhs.identifier
     }
 }
 

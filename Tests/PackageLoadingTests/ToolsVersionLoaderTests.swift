@@ -10,12 +10,12 @@
 
 import XCTest
 
-import Basic
-import TestSupport
+import TSCBasic
+import SPMTestSupport
 
 import PackageModel
 import PackageLoading
-import Utility
+import TSCUtility
 
 class ToolsVersionLoaderTests: XCTestCase {
 
@@ -83,12 +83,12 @@ class ToolsVersionLoaderTests: XCTestCase {
             stream <<< "// swift-tools-version:4.1.0\n\n\n\n"
             stream <<< "let package = .."
             try load(stream.bytes) { toolsVersion in
-                XCTAssertEqual(toolsVersion, ToolsVersion.defaultToolsVersion)
+                XCTAssertEqual(toolsVersion, .v3)
             }
         }
 
         try load("// \n// swift-tools-version:6.1.0\n") { toolsVersion in
-            XCTAssertEqual(toolsVersion, ToolsVersion.defaultToolsVersion)
+            XCTAssertEqual(toolsVersion, .v3)
         }
 
         assertFailure("//swift-tools-:6.1.0\n", "//swift-tools-:6.1.0")
@@ -148,23 +148,49 @@ class ToolsVersionLoaderTests: XCTestCase {
         }
     }
 
+    func testVersionSpecificManifestFallbacks() throws {
+        let fs = InMemoryFileSystem(emptyFiles:
+            "/pkg/foo"
+        )
+        let root = AbsolutePath("/pkg")
+
+        try fs.writeFileContents(root.appending(component: "Package.swift"), bytes: "// swift-tools-version:1.0.0\n")
+        try fs.writeFileContents(root.appending(component: "Package@swift-4.2.swift"), bytes: "// swift-tools-version:3.4.5\n")
+        try fs.writeFileContents(root.appending(component: "Package@swift-15.1.swift"), bytes: "// swift-tools-version:3.4.6\n")
+        try fs.writeFileContents(root.appending(component: "Package@swift-15.2.swift"), bytes: "// swift-tools-version:3.4.7\n")
+        try fs.writeFileContents(root.appending(component: "Package@swift-15.3.swift"), bytes: "// swift-tools-version:3.4.8\n")
+
+        do {
+            let version = try ToolsVersionLoader(currentToolsVersion: ToolsVersion(version: "15.1.1")).load(at: root, fileSystem: fs)
+            XCTAssertEqual(version.description, "3.4.6")
+        }
+
+        do {
+            let version = try ToolsVersionLoader(currentToolsVersion: ToolsVersion(version: "15.2.5")).load(at: root, fileSystem: fs)
+            XCTAssertEqual(version.description, "3.4.7")
+        }
+
+        do {
+            let version = try ToolsVersionLoader(currentToolsVersion: ToolsVersion(version: "3.0.0")).load(at: root, fileSystem: fs)
+            XCTAssertEqual(version.description, "1.0.0")
+        }
+
+        do {
+            let version = try ToolsVersionLoader(currentToolsVersion: ToolsVersion(version: "15.3.0")).load(at: root, fileSystem: fs)
+            XCTAssertEqual(version.description, "3.4.8")
+        }
+    }
+
     func assertFailure(_ bytes: ByteString, _ theSpecifier: String, file: StaticString = #file, line: UInt = #line) {
         do {
             try load(bytes) {
                 XCTFail("unexpected success - \($0)", file: file, line: line)
             }
             XCTFail("unexpected success", file: file, line: line)
-        } catch ToolsVersionLoader.Error.malformed(let specifier, let path) {
+        } catch ToolsVersionLoader.Error.malformed(let specifier, _) {
             XCTAssertEqual(specifier, theSpecifier, file: file, line: line)
-            XCTAssertEqual(path, AbsolutePath("/pkg/Package.swift"), file: file, line: line)
         } catch {
             XCTFail("Failed with error \(error)")
         }
     }
-
-    static var allTests = [
-        ("testBasics", testBasics),
-        ("testNonMatching", testNonMatching),
-        ("testVersionSpecificManifest", testVersionSpecificManifest),
-    ]
 }

@@ -10,40 +10,19 @@ See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 
 import class Foundation.ProcessInfo
 
-import Basic
+import TSCBasic
+import SPMBuildCore
 import Build
-import Utility
+import TSCUtility
+import PackageGraph
+import Workspace
 
-import func POSIX.exit
-
-
-/// Diagnostics info for deprecated `--specifier` option.
-struct SpecifierDeprecatedDiagnostic: DiagnosticData {
-    static let id = DiagnosticID(
-        type: SpecifierDeprecatedDiagnostic.self,
-        name: "org.swift.diags.specifier-deprecated",
-        defaultBehavior: .warning,
-        description: {
-            $0 <<< "'--specifier' option is deprecated; use '--filter' instead"
-        }
-    )
-}
-
-/// Diagnostic data for zero --filter matches.
-struct NoMatchingTestsWarning: DiagnosticData {
-    static let id = DiagnosticID(
-        type: NoMatchingTestsWarning.self,
-        name: "org.swift.diags.no-matching-tests",
-        defaultBehavior: .note,
-        description: {
-            $0 <<< "'--filter' predicate did not match any test case"
-        }
-    )
-}
+import func TSCLibc.exit
 
 private enum TestError: Swift.Error {
     case invalidListTestJSONData
     case testsExecutableNotFound
+    case multipleTestProducts([String])
 }
 
 extension TestError: CustomStringConvertible {
@@ -53,6 +32,8 @@ extension TestError: CustomStringConvertible {
             return "no tests found; create a target in the 'Tests' directory"
         case .invalidListTestJSONData:
             return "invalid list test JSON structure"
+        case .multipleTestProducts(let products):
+            return "found multiple test products: \(products.joined(separator: ", ")); use --test-product to select one"
         }
     }
 }
@@ -73,6 +54,14 @@ public class TestToolOptions: ToolOptions {
             return .listTests
         }
 
+        if shouldGenerateLinuxMain {
+            return .generateLinuxMain
+        }
+
+        if shouldPrintCodeCovPath {
+            return .codeCovPath
+        }
+
         return .runSerial
     }
 
@@ -82,10 +71,54 @@ public class TestToolOptions: ToolOptions {
     /// If tests should run in parallel mode.
     var shouldRunInParallel = false
 
+    /// Number of tests to execute in parallel
+    var numberOfWorkers: Int?
+
     /// List the tests and exit.
     var shouldListTests = false
 
-    var testCaseSpecifier: TestCaseSpecifier = .none
+    /// Generate LinuxMain entries and exit.
+    var shouldGenerateLinuxMain = false
+
+    /// If the path of the exported code coverage JSON should be printed.
+    var shouldPrintCodeCovPath = false
+
+    var testCaseSpecifier: TestCaseSpecifier {
+        testCaseSpecifierOverride() ?? _testCaseSpecifier
+    }
+
+    var _testCaseSpecifier: TestCaseSpecifier = .none
+
+    /// Path where the xUnit xml file should be generated.
+    var xUnitOutput: AbsolutePath?
+
+    /// The test product to use. This is useful when there are multiple test products
+    /// to choose from (usually in multiroot packages).
+    public var testProduct: String?
+
+    /// Returns the test case specifier if overridden in the env.
+    private func testCaseSpecifierOverride() -> TestCaseSpecifier? {
+        guard let override = ProcessEnv.vars["_SWIFTPM_SKIP_TESTS_LIST"] else {
+            return nil
+        }
+
+        do {
+            let skipTests: [String.SubSequence]
+            // Read from the file if it exists.
+            if let path = try? AbsolutePath(validating: override), localFileSystem.exists(path) {
+                let contents = try localFileSystem.readFileContents(path).cString
+                skipTests = contents.split(separator: "\n", omittingEmptySubsequences: true)
+            } else {
+                // Otherwise, read the env variable.
+                skipTests = override.split(separator: ":", omittingEmptySubsequences: true)
+            }
+
+            return .skip(skipTests.map(String.init))
+        } catch {
+            // FIXME: We should surface errors from here.
+        }
+        return nil
+    }
 }
 
 /// Tests filtering specifier
@@ -98,11 +131,14 @@ public enum TestCaseSpecifier {
     case none
     case specific(String)
     case regex(String)
+    case skip([String])
 }
 
 public enum TestMode {
     case version
     case listTests
+    case codeCovPath
+    case generateLinuxMain
     case runSerial
     case runParallel
 }
@@ -122,13 +158,16 @@ public class SwiftTestTool: SwiftTool<TestToolOptions> {
 
     override func runImpl() throws {
 
+        // Validate commands arguments
+        try validateArguments()
+
         switch options.mode {
         case .version:
             print(Versioning.currentVersion.completeDisplayString)
 
         case .listTests:
-            let testPath = try buildTestsIfNeeded(options)
-            let testSuites = try getTestSuites(path: testPath)
+            let testProducts = try buildTestsIfNeeded()
+            let testSuites = try getTestSuites(in: testProducts)
             let tests = testSuites.filteredTests(specifier: options.testCaseSpecifier)
 
             // Print the tests.
@@ -136,81 +175,208 @@ public class SwiftTestTool: SwiftTool<TestToolOptions> {
                 print(test.specifier)
             }
 
+        case .codeCovPath:
+            let workspace = try getActiveWorkspace()
+            let root = try getWorkspaceRoot()
+            let rootManifest = workspace.loadRootManifests(packages: root.packages, diagnostics: diagnostics)[0]
+            let buildParameters = try self.buildParameters()
+            print(codeCovAsJSONPath(buildParameters: buildParameters, packageName: rootManifest.name))
+
+        case .generateLinuxMain:
+          #if os(Linux)
+            diagnostics.emit(warning: "can't discover tests on Linux; please use this option on macOS instead")
+          #endif
+            let graph = try loadPackageGraph()
+            let testProducts = try buildTestsIfNeeded()
+            let testSuites = try getTestSuites(in: testProducts)
+            let allTestSuites = testSuites.values.flatMap { $0 }
+            let generator = LinuxMainGenerator(graph: graph, testSuites: allTestSuites)
+            try generator.generate()
+
         case .runSerial:
-            let testPath = try buildTestsIfNeeded(options)
-            var ranSuccessfully = true
+            let toolchain = try getToolchain()
+            let testProducts = try buildTestsIfNeeded()
+            let buildParameters = try self.buildParameters()
+
+            // Clean out the code coverage directory that may contain stale
+            // profraw files from a previous run of the code coverage tool.
+            if options.shouldEnableCodeCoverage {
+                try localFileSystem.removeFileTree(buildParameters.codeCovPath)
+            }
+
+            let xctestArg: String?
 
             switch options.testCaseSpecifier {
             case .none:
-                let runner = TestRunner(path: testPath, xctestArg: nil, processSet: processSet)
-                ranSuccessfully = runner.test()
+                xctestArg = nil
 
-            case .regex, .specific:
+            case .regex, .specific, .skip:
                 // If old specifier `-s` option was used, emit deprecation notice.
                 if case .specific = options.testCaseSpecifier {
-                    diagnostics.emit(data: SpecifierDeprecatedDiagnostic())
+                    diagnostics.emit(warning: "'--specifier' option is deprecated; use '--filter' instead")
                 }
 
                 // Find the tests we need to run.
-                let testSuites = try getTestSuites(path: testPath)
+                let testSuites = try getTestSuites(in: testProducts)
                 let tests = testSuites.filteredTests(specifier: options.testCaseSpecifier)
 
                 // If there were no matches, emit a warning.
                 if tests.isEmpty {
-                    diagnostics.emit(data: NoMatchingTestsWarning())
+                    diagnostics.emit(.noMatchingTests)
                 }
 
-                // Finally, run the tests.
-                for test in tests {
-                    let runner = TestRunner(path: testPath, xctestArg: test.specifier, processSet: processSet)
-                    ranSuccessfully = runner.test() && ranSuccessfully
-                }
+                xctestArg = tests.map { $0.specifier }.joined(separator: ",")
             }
 
+            let runner = TestRunner(
+                bundlePaths: testProducts.map { $0.bundlePath },
+                xctestArg: xctestArg,
+                processSet: processSet,
+                toolchain: toolchain,
+                diagnostics: diagnostics,
+                options: self.options,
+                buildParameters: buildParameters
+            )
+
+            // Finally, run the tests.
+            let ranSuccessfully: Bool = runner.test()
             if !ranSuccessfully {
                 executionStatus = .failure
             }
 
+            if options.shouldEnableCodeCoverage {
+                try processCodeCoverage(testProducts)
+            }
+
         case .runParallel:
-            let testPath = try buildTestsIfNeeded(options)
-            let testSuites = try getTestSuites(path: testPath)
+            let toolchain = try getToolchain()
+            let testProducts = try buildTestsIfNeeded()
+            let testSuites = try getTestSuites(in: testProducts)
             let tests = testSuites.filteredTests(specifier: options.testCaseSpecifier)
+            let buildParameters = try self.buildParameters()
 
             // If there were no matches, emit a warning and exit.
             if tests.isEmpty {
-                diagnostics.emit(data: NoMatchingTestsWarning())
+                diagnostics.emit(.noMatchingTests)
                 return
             }
 
+            // Clean out the code coverage directory that may contain stale
+            // profraw files from a previous run of the code coverage tool.
+            if options.shouldEnableCodeCoverage {
+                try localFileSystem.removeFileTree(buildParameters.codeCovPath)
+            }
+
             // Run the tests using the parallel runner.
-            let runner = ParallelTestRunner(testPath: testPath, processSet: processSet)
+            let runner = ParallelTestRunner(
+                bundlePaths: testProducts.map { $0.bundlePath },
+                processSet: processSet,
+                toolchain: toolchain,
+                xUnitOutput: options.xUnitOutput,
+                numJobs: options.numberOfWorkers ?? ProcessInfo.processInfo.activeProcessorCount,
+                diagnostics: diagnostics,
+                options: self.options,
+                buildParameters: buildParameters
+            )
             try runner.run(tests)
 
             if !runner.ranSuccessfully {
                 executionStatus = .failure
             }
+
+            if options.shouldEnableCodeCoverage {
+                try processCodeCoverage(testProducts)
+            }
         }
+    }
+
+    /// Processes the code coverage data and emits a json.
+    private func processCodeCoverage(_ testProducts: [BuiltTestProduct]) throws {
+        // Merge all the profraw files to produce a single profdata file.
+        try mergeCodeCovRawDataFiles()
+
+        let buildParameters = try self.buildParameters()
+        for product in testProducts {
+            // Export the codecov data as JSON.
+            let jsonPath = codeCovAsJSONPath(
+                buildParameters: buildParameters,
+                packageName: product.packageName)
+            try exportCodeCovAsJSON(to: jsonPath, testBinary: product.binaryPath)
+        }
+    }
+
+    /// Merges all profraw profiles in codecoverage directory into default.profdata file.
+    private func mergeCodeCovRawDataFiles() throws {
+        // Get the llvm-prof tool.
+        let llvmProf = try getToolchain().getLLVMProf()
+
+        // Get the profraw files.
+        let buildParameters = try self.buildParameters()
+        let codeCovFiles = try localFileSystem.getDirectoryContents(buildParameters.codeCovPath)
+
+        // Construct arguments for invoking the llvm-prof tool.
+        var args = [llvmProf.pathString, "merge", "-sparse"]
+        for file in codeCovFiles {
+            let filePath = buildParameters.codeCovPath.appending(component: file)
+            if filePath.extension == "profraw" {
+                args.append(filePath.pathString)
+            }
+        }
+        args += ["-o", buildParameters.codeCovDataFile.pathString]
+
+        try Process.checkNonZeroExit(arguments: args)
+    }
+
+    private func codeCovAsJSONPath(buildParameters: BuildParameters, packageName: String) -> AbsolutePath {
+        return buildParameters.codeCovPath.appending(component: packageName + ".json")
+    }
+
+    /// Exports profdata as a JSON file.
+    private func exportCodeCovAsJSON(to path: AbsolutePath, testBinary: AbsolutePath) throws {
+        // Export using the llvm-cov tool.
+        let llvmCov = try getToolchain().getLLVMCov()
+        let buildParameters = try self.buildParameters()
+        let args = [
+            llvmCov.pathString,
+            "export",
+            "-instr-profile=\(buildParameters.codeCovDataFile)",
+            testBinary.pathString
+        ]
+        let result = try Process.popen(arguments: args)
+
+        if result.exitStatus != .terminated(code: 0) {
+            let output = try result.utf8Output() + result.utf8stderrOutput()
+            throw StringError("Unable to export code coverage:\n \(output)")
+        }
+        try localFileSystem.writeFileContents(path, bytes: ByteString(result.output.get()))
     }
 
     /// Builds the "test" target if enabled in options.
     ///
-    /// - Returns: The path to the test binary.
-    private func buildTestsIfNeeded(_ options: TestToolOptions) throws -> AbsolutePath {
-        let buildPlan = try self.buildPlan()
+    /// - Returns: The paths to the build test products.
+    private func buildTestsIfNeeded() throws -> [BuiltTestProduct] {
+        let buildSystem = try createBuildSystem()
+
         if options.shouldBuildTests {
-            try build(plan: buildPlan, subset: .allIncludingTests)
+            let subset = options.testProduct.map(BuildSubset.product) ?? .allIncludingTests
+            try buildSystem.build(subset: subset)
         }
 
-        guard let testProduct = buildPlan.buildProducts.first(where: { $0.product.type == .test }) else {
+        // Find the test product.
+        let testProducts = buildSystem.builtTestProducts
+        guard !testProducts.isEmpty else {
             throw TestError.testsExecutableNotFound
         }
 
-        // Go up the folder hierarchy until we find the .xctest bundle.
-        return sequence(first: testProduct.binary, next: {
-            $0.isRoot ? nil : $0.parentDirectory
-        }).first(where: {
-            $0.basename.hasSuffix(".xctest")
-        })!
+        if let testProductName = options.testProduct {
+            guard let selectedTestProduct = testProducts.first(where: { $0.productName == testProductName }) else {
+                throw TestError.testsExecutableNotFound
+            }
+
+            return [selectedTestProduct]
+        } else {
+            return testProducts
+        }
     }
 
     override class func defineArguments(parser: ArgumentParser, binder: ArgumentBinder<TestToolOptions>) {
@@ -226,78 +392,138 @@ public class SwiftTestTool: SwiftTool<TestToolOptions> {
             to: { $0.shouldListTests = $1 })
 
         binder.bind(
+            option: parser.add(option: "--generate-linuxmain", kind: Bool.self,
+                usage: "Generate LinuxMain.swift entries for the package"),
+            to: { $0.shouldGenerateLinuxMain = $1 })
+
+        binder.bind(
             option: parser.add(option: "--parallel", kind: Bool.self,
                 usage: "Run the tests in parallel."),
             to: { $0.shouldRunInParallel = $1 })
 
         binder.bind(
+            option: parser.add(option: "--num-workers", kind: Int.self,
+                               usage: "Number of tests to execute in parallel."),
+            to: { $0.numberOfWorkers = $1 })
+
+        binder.bind(
             option: parser.add(option: "--specifier", shortName: "-s", kind: String.self),
-            to: { $0.testCaseSpecifier = .specific($1) })
+            to: { $0._testCaseSpecifier = .specific($1) })
+
+        binder.bind(
+            option: parser.add(option: "--xunit-output", kind: PathArgument.self),
+            to: { $0.xUnitOutput = $1.path })
 
         binder.bind(
             option: parser.add(option: "--filter", kind: String.self,
                 usage: "Run test cases matching regular expression, Format: <test-target>.<test-case> or " +
                     "<test-target>.<test-case>/<test>"),
-            to: { $0.testCaseSpecifier = .regex($1) })
+            to: { $0._testCaseSpecifier = .regex($1) })
+
+        binder.bind(
+            option: parser.add(option: "--enable-code-coverage", kind: Bool.self,
+                usage: "Test with code coverage enabled"),
+            to: { $0.shouldEnableCodeCoverage = $1 })
+
+        binder.bind(
+            option: parser.add(option: "--show-codecov-path", kind: Bool.self,
+                usage: "Print the path of the exported code coverage JSON file"),
+            to: { $0.shouldPrintCodeCovPath = $1 })
+
+        binder.bind(
+            option: parser.add(option: "--test-product", kind: String.self, usage: nil),
+            to: { $0.testProduct = $1 })
     }
 
     /// Locates XCTestHelper tool inside the libexec directory and bin directory.
     /// Note: It is a fatalError if we are not able to locate the tool.
     ///
     /// - Returns: Path to XCTestHelper tool.
-    private static func xctestHelperPath() -> AbsolutePath {
+    private func xctestHelperPath() -> AbsolutePath {
         let xctestHelperBin = "swiftpm-xctest-helper"
         let binDirectory = AbsolutePath(CommandLine.arguments.first!,
-            relativeTo: currentWorkingDirectory).parentDirectory
+            relativeTo: originalWorkingDirectory).parentDirectory
         // XCTestHelper tool is installed in libexec.
         let maybePath = binDirectory.parentDirectory.appending(components: "libexec", "swift", "pm", xctestHelperBin)
-        if isFile(maybePath) {
+        if localFileSystem.isFile(maybePath) {
             return maybePath
         }
         // This will be true during swiftpm development.
         // FIXME: Factor all of the development-time resource location stuff into a common place.
         let path = binDirectory.appending(component: xctestHelperBin)
-        if isFile(path) {
+        if localFileSystem.isFile(path) {
             return path
         }
         fatalError("XCTestHelper binary not found.")
     }
 
+    fileprivate func getTestSuites(in testProducts: [BuiltTestProduct]) throws -> [AbsolutePath: [TestSuite]] {
+        let testSuitesByProduct = try testProducts
+            .map { try ($0.bundlePath, self.getTestSuites(fromTestAt: $0.bundlePath)) }
+        return Dictionary(uniqueKeysWithValues: testSuitesByProduct)
+    }
+
     /// Runs the corresponding tool to get tests JSON and create TestSuite array.
-    /// On OSX, we use the swiftpm-xctest-helper tool bundled with swiftpm.
+    /// On macOS, we use the swiftpm-xctest-helper tool bundled with swiftpm.
     /// On Linux, XCTest can dump the json using `--dump-tests-json` mode.
     ///
     /// - Parameters:
-    ///     - path: Path to the XCTest bundle(OSX) or executable(Linux).
+    ///     - path: Path to the XCTest bundle(macOS) or executable(Linux).
     ///
-    /// - Throws: TestError, SystemError, Utility.Errror
+    /// - Throws: TestError, SystemError, TSCUtility.Error
     ///
     /// - Returns: Array of TestSuite
-    fileprivate func getTestSuites(path: AbsolutePath) throws -> [TestSuite] {
+    fileprivate func getTestSuites(fromTestAt path: AbsolutePath) throws -> [TestSuite] {
         // Run the correct tool.
       #if os(macOS)
-        let tempFile = try TemporaryFile()
-        let args = [SwiftTestTool.xctestHelperPath().asString, path.asString, tempFile.path.asString]
-        var env = ProcessInfo.processInfo.environment
-        // Add the sdk platform path if we have it. If this is not present, we
-        // might always end up failing.
-        if let sdkPlatformFrameworksPath = Destination.sdkPlatformFrameworkPath() {
-            env["DYLD_FRAMEWORK_PATH"] = sdkPlatformFrameworksPath.asString
+        let data: String = try withTemporaryFile { tempFile in
+            let args = [xctestHelperPath().pathString, path.pathString, tempFile.path.pathString]
+            var env = try constructTestEnvironment(toolchain: try getToolchain(), options: self.options, buildParameters: self.buildParameters())
+            // Add the sdk platform path if we have it. If this is not present, we
+            // might always end up failing.
+            if let sdkPlatformFrameworksPath = Destination.sdkPlatformFrameworkPaths() {
+                env["DYLD_FRAMEWORK_PATH"] = sdkPlatformFrameworksPath.fwk.pathString
+                env["DYLD_LIBRARY_PATH"] = sdkPlatformFrameworksPath.lib.pathString
+            }
+            try Process.checkNonZeroExit(arguments: args, environment: env)
+            // Read the temporary file's content.
+            return try localFileSystem.readFileContents(tempFile.path).validDescription ?? ""
         }
-        try Process.checkNonZeroExit(arguments: args, environment: env)
-        // Read the temporary file's content.
-        let data = try fopen(tempFile.path).readFileContents()
       #else
-        let args = [path.asString, "--dump-tests-json"]
+        let args = [path.description, "--dump-tests-json"]
         let data = try Process.checkNonZeroExit(arguments: args)
       #endif
         // Parse json and return TestSuites.
         return try TestSuite.parse(jsonString: data)
     }
+
+    /// Private function that validates the commands arguments
+    ///
+    /// - Throws: if a command argument is invalid
+    private func validateArguments() throws {
+
+        // Validation for --num-workers.
+        if let workers = options.numberOfWorkers {
+
+            // The --num-worker option should be called with --parallel.
+            guard options.mode == .runParallel else {
+                diagnostics.emit(error: "--num-workers must be used with --parallel")
+                throw Diagnostics.fatalError
+            }
+
+            guard workers > 0 else {
+                diagnostics.emit(error: "'--num-workers' must be greater than zero")
+                throw Diagnostics.fatalError
+            }
+        }
+    }
 }
 
 /// A structure representing an individual unit test.
 struct UnitTest {
+    /// The path to the test product containing the test.
+    let productPath: AbsolutePath
+
     /// The name of the unit test.
     let name: String
 
@@ -313,38 +539,88 @@ struct UnitTest {
 /// A class to run tests on a XCTest binary.
 ///
 /// Note: Executes the XCTest with inherited environment as it is convenient to pass senstive
-/// information like username, password etc to test cases via enviornment variables.
+/// information like username, password etc to test cases via environment variables.
 final class TestRunner {
-    /// Path to valid XCTest binary.
-    private let path: AbsolutePath
+    /// Path to valid XCTest binaries.
+    private let bundlePaths: [AbsolutePath]
 
     /// Arguments to pass to XCTest if any.
     private let xctestArg: String?
 
     private let processSet: ProcessSet
 
+    // The toolchain to use.
+    private let toolchain: UserToolchain
+
+    /// Diagnostics Engine to emit diagnostics.
+    let diagnostics: DiagnosticsEngine
+
+    private let options: ToolOptions
+
+    private let buildParameters: BuildParameters
+
     /// Creates an instance of TestRunner.
     ///
     /// - Parameters:
-    ///     - path: Path to valid XCTest binary.
+    ///     - testPaths: Paths to valid XCTest binaries.
     ///     - xctestArg: Arguments to pass to XCTest.
-    init(path: AbsolutePath, xctestArg: String? = nil, processSet: ProcessSet) {
-        self.path = path
+    init(
+        bundlePaths: [AbsolutePath],
+        xctestArg: String? = nil,
+        processSet: ProcessSet,
+        toolchain: UserToolchain,
+        diagnostics: DiagnosticsEngine,
+        options: ToolOptions,
+        buildParameters: BuildParameters
+    ) {
+        self.bundlePaths = bundlePaths
         self.xctestArg = xctestArg
         self.processSet = processSet
+        self.toolchain = toolchain
+        self.diagnostics = diagnostics
+        self.options = options
+        self.buildParameters = buildParameters
+    }
+
+    /// Executes the tests without printing anything on standard streams.
+    ///
+    /// - Returns: A tuple with first bool member indicating if test execution returned code 0 and second argument
+    ///   containing the output of the execution.
+    public func test() -> (Bool, String) {
+        var success = true
+        var output = ""
+        for path in bundlePaths {
+            let (testSuccess, testOutput) = test(testAt: path)
+            success = success && testSuccess
+            output += testOutput
+        }
+        return (success, output)
+    }
+
+    /// Executes and returns execution status. Prints test output on standard streams.
+    public func test() -> Bool {
+        var success = true
+        for path in bundlePaths {
+            let testSuccess: Bool = test(testAt: path)
+            success = success && testSuccess
+        }
+        return success
     }
 
     /// Constructs arguments to execute XCTest.
-    private func args() -> [String] {
+    private func args(forTestAt testPath: AbsolutePath) throws -> [String] {
         var args: [String] = []
       #if os(macOS)
-        args = ["xcrun", "--sdk", "macosx", "xctest"]
+        guard let xctest = toolchain.xctest else {
+            throw TestError.testsExecutableNotFound
+        }
+        args = [xctest.pathString]
         if let xctestArg = xctestArg {
             args += ["-XCTest", xctestArg]
         }
-        args += [path.asString]
+        args += [testPath.pathString]
       #else
-        args += [path.asString]
+        args += [testPath.description]
         if let xctestArg = xctestArg {
             args += [xctestArg]
         }
@@ -356,14 +632,17 @@ final class TestRunner {
     ///
     /// - Returns: A tuple with first bool member indicating if test execution returned code 0
     ///            and second argument containing the output of the execution.
-    func test() -> (Bool, String) {
+    private func test(testAt testPath: AbsolutePath) -> (Bool, String) {
         var output = ""
         var success = false
         do {
-            let process = Process(arguments: args(), redirectOutput: true, verbose: false)
+            // FIXME: The environment will be constructed for every test when using the
+            // parallel test runner. We should do some kind of caching.
+            let env = try constructTestEnvironment(toolchain: toolchain, options: self.options, buildParameters: self.buildParameters)
+            let process = Process(arguments: try args(forTestAt: testPath), environment: env, outputRedirection: .collect, verbose: false)
             try process.launch()
             let result = try process.waitUntilExit()
-            output = try (result.utf8Output() + result.utf8stderrOutput()).chuzzle() ?? ""
+            output = try (result.utf8Output() + result.utf8stderrOutput()).spm_chuzzle() ?? ""
             switch result.exitStatus {
             case .terminated(code: 0):
                 success = true
@@ -371,14 +650,17 @@ final class TestRunner {
                 output += "\n" + exitSignalText(code: signal)
             default: break
             }
-        } catch {}
+        } catch {
+            diagnostics.emit(error)
+        }
         return (success, output)
     }
 
     /// Executes and returns execution status. Prints test output on standard streams.
-    func test() -> Bool {
+    private func test(testAt testPath: AbsolutePath) -> Bool {
         do {
-            let process = Process(arguments: args(), redirectOutput: false)
+            let env = try constructTestEnvironment(toolchain: toolchain, options: self.options, buildParameters: self.buildParameters)
+            let process = Process(arguments: try args(forTestAt: testPath), environment: env, outputRedirection: .none)
             try processSet.add(process)
             try process.launch()
             let result = try process.waitUntilExit()
@@ -389,7 +671,9 @@ final class TestRunner {
                 print(exitSignalText(code: signal))
             default: break
             }
-        } catch {}
+        } catch {
+            diagnostics.emit(error)
+        }
         return false
     }
 
@@ -407,8 +691,8 @@ final class ParallelTestRunner {
         var success: Bool
     }
 
-    /// Path to XCTest binary.
-    private let testPath: AbsolutePath
+    /// Path to XCTest binaries.
+    private let bundlePaths: [AbsolutePath]
 
     /// The queue containing list of tests to run (producer).
     private let pendingTests = SynchronizedQueue<UnitTest?>()
@@ -416,14 +700,8 @@ final class ParallelTestRunner {
     /// The queue containing tests which are finished running.
     private let finishedTests = SynchronizedQueue<TestResult?>()
 
-    /// Number of parallel workers to spawn.
-    private var numJobs: Int {
-        return ProcessInfo.processInfo.activeProcessorCount
-    }
-
-    /// Instance of progress bar. Animating progress bar if stream is a terminal otherwise
-    /// a simple progress bar.
-    private let progressBar: ProgressBarProtocol
+    /// Instance of a terminal progress animation.
+    private let progressAnimation: ProgressAnimationProtocol
 
     /// Number of tests that will be executed.
     private var numTests = 0
@@ -436,10 +714,45 @@ final class ParallelTestRunner {
 
     let processSet: ProcessSet
 
-    init(testPath: AbsolutePath, processSet: ProcessSet) {
-        self.testPath = testPath
+    let toolchain: UserToolchain
+    let xUnitOutput: AbsolutePath?
+
+    let options: ToolOptions
+    let buildParameters: BuildParameters
+
+    /// Number of tests to execute in parallel.
+    let numJobs: Int
+
+    /// Diagnostics Engine to emit diagnostics.
+    let diagnostics: DiagnosticsEngine
+
+    init(
+        bundlePaths: [AbsolutePath],
+        processSet: ProcessSet,
+        toolchain: UserToolchain,
+        xUnitOutput: AbsolutePath? = nil,
+        numJobs: Int,
+        diagnostics: DiagnosticsEngine,
+        options: ToolOptions,
+        buildParameters: BuildParameters
+    ) {
+        self.bundlePaths = bundlePaths
         self.processSet = processSet
-        progressBar = createProgressBar(forStream: stdoutStream, header: "Tests")
+        self.toolchain = toolchain
+        self.xUnitOutput = xUnitOutput
+        self.numJobs = numJobs
+        self.diagnostics = diagnostics
+
+        if ProcessEnv.vars["SWIFTPM_TEST_RUNNER_PROGRESS_BAR"] == "lit" {
+            progressAnimation = PercentProgressAnimation(stream: stdoutStream, header: "Testing:")
+        } else {
+            progressAnimation = NinjaProgressAnimation(stream: stdoutStream)
+        }
+
+        self.options = options
+        self.buildParameters = buildParameters
+
+        assert(numJobs > 0, "num jobs should be > 0")
     }
 
     /// Whether to display output from successful tests.
@@ -452,18 +765,15 @@ final class ParallelTestRunner {
     /// Updates the progress bar status.
     private func updateProgress(for test: UnitTest) {
         numCurrentTest += 1
-        progressBar.update(percent: 100*numCurrentTest/numTests, text: test.specifier)
+        progressAnimation.update(step: numCurrentTest, total: numTests, text: "Testing \(test.specifier)")
     }
 
     private func enqueueTests(_ tests: [UnitTest]) throws {
-        // FIXME: Add a count property in SynchronizedQueue.
-        var numTests = 0
         // Enqueue all the tests.
         for test in tests {
-            numTests += 1
             pendingTests.enqueue(test)
         }
-        self.numTests = numTests
+        self.numTests = tests.count
         self.numCurrentTest = 0
         // Enqueue the sentinels, we stop a thread when it encounters a sentinel in the queue.
         for _ in 0..<numJobs {
@@ -483,7 +793,14 @@ final class ParallelTestRunner {
                 // Dequeue a specifier and run it till we encounter nil.
                 while let test = self.pendingTests.dequeue() {
                     let testRunner = TestRunner(
-                        path: self.testPath, xctestArg: test.specifier, processSet: self.processSet)
+                        bundlePaths: [test.productPath],
+                        xctestArg: test.specifier,
+                        processSet: self.processSet,
+                        toolchain: self.toolchain,
+                        diagnostics: self.diagnostics,
+                        options: self.options,
+                        buildParameters: self.buildParameters
+                    )
                     let (success, output) = testRunner.test()
                     if !success {
                         self.ranSuccessfully = false
@@ -495,41 +812,50 @@ final class ParallelTestRunner {
             return thread
         })
 
-        // Holds the output of test cases.
-        var outputs: (success: [String], failure: [String]) = ([], [])
+        // List of processed tests.
+        var processedTests: [TestResult] = []
+        let processedTestsLock = TSCBasic.Lock()
 
         // Report (consume) the tests which have finished running.
         while let result = finishedTests.dequeue() {
             updateProgress(for: result.unitTest)
-            if result.success {
-                if shouldOutputSuccess {
-                    outputs.success.append(result.output)
-                }
-            } else {
-                outputs.failure.append(result.output)
+
+            // Store the result.
+            processedTestsLock.withLock {
+                processedTests.append(result)
             }
+
             // We can't enqueue a sentinel into finished tests queue because we won't know
             // which test is last one so exit this when all the tests have finished running.
-            if numCurrentTest == numTests { break }
+            if numCurrentTest == numTests {
+                break
+            }
         }
 
         // Wait till all threads finish execution.
         workers.forEach { $0.join() }
-        progressBar.complete()
-        
-        if shouldOutputSuccess {
-            printOutput(outputs.success)
+
+        // Report the completion.
+        progressAnimation.complete(success: processedTests.contains(where: { !$0.success }))
+
+        // Print test results.
+        for test in processedTests {
+            if !test.success || shouldOutputSuccess {
+                print(test)
+            }
         }
-        printOutput(outputs.failure)
+
+        // Generate xUnit file if requested.
+        if let xUnitOutput = xUnitOutput {
+            try XUnitGenerator(processedTests).generate(at: xUnitOutput)
+        }
     }
 
-    /// Prints the output of the tests.
-    private func printOutput(_ lineOutput: [String]) {
+    // Print a test result.
+    private func print(_ test: TestResult) {
         stdoutStream <<< "\n"
-        for error in lineOutput {
-            stdoutStream <<< error
-        }
-        if !lineOutput.isEmpty {
+        stdoutStream <<< test.output
+        if !test.output.isEmpty {
             stdoutStream <<< "\n"
         }
         stdoutStream.flush()
@@ -603,19 +929,27 @@ struct TestSuite {
                 })
                 return TestSuite.TestCase(name: name, tests: testMethods)
             })
-            
+
             return TestSuite(name: name, tests: testCases)
         })
     }
 }
 
 
-fileprivate extension Sequence where Iterator.Element == TestSuite {
+fileprivate extension Dictionary where Key == AbsolutePath, Value == [TestSuite] {
     /// Returns all the unit tests of the test suites.
     var allTests: [UnitTest] {
-        return flatMap { $0.tests }.flatMap({ testCase in
-            testCase.tests.map{ UnitTest(name: $0, testCase: testCase.name) }
-        })
+        var allTests: [UnitTest] = []
+        for (bundlePath, testSuites) in self {
+            for testSuite in testSuites {
+                for testCase in testSuite.tests {
+                    for test in testCase.tests {
+                        allTests.append(UnitTest(productPath: bundlePath, name: test, testCase: testCase.name))
+                    }
+                }
+            }
+        }
+        return allTests
     }
 
     /// Return tests matching the provided specifier
@@ -630,6 +964,14 @@ fileprivate extension Sequence where Iterator.Element == TestSuite {
             })
         case .specific(let name):
             return allTests.filter{ $0.specifier == name }
+        case .skip(let skippedTests):
+            var result = allTests
+            for skippedTest in skippedTests {
+                result = result.filter{
+                    $0.specifier.range(of: skippedTest, options: .regularExpression) == nil
+                }
+            }
+            return result
         }
     }
 }
@@ -637,5 +979,110 @@ fileprivate extension Sequence where Iterator.Element == TestSuite {
 extension SwiftTestTool: ToolName {
     static var toolName: String {
         return "swift test"
+    }
+}
+
+/// Creates the environment needed to test related tools.
+fileprivate func constructTestEnvironment(
+    toolchain: UserToolchain,
+    options: ToolOptions,
+    buildParameters: BuildParameters
+) throws -> [String: String] {
+    var env = ProcessEnv.vars
+
+    // Add the code coverage related variables.
+    if options.shouldEnableCodeCoverage {
+        // Defines the path at which the profraw files will be written on test execution.
+        //
+        // `%m` will create a pool of profraw files and append the data from
+        // each execution in one of the files. This doesn't matter for serial
+        // execution but is required when the tests are running in parallel as
+        // SwiftPM repeatedly invokes the test binary with the test case name as
+        // the filter.
+        let codecovProfile = buildParameters.buildPath.appending(components: "codecov", "default%m.profraw")
+        env["LLVM_PROFILE_FILE"] = codecovProfile.pathString
+    }
+
+  #if !os(macOS)
+    return env
+  #else
+    // Fast path when no sanitizers are enabled.
+    if options.sanitizers.isEmpty {
+        return env
+    }
+
+    // Get the runtime libraries.
+    var runtimes = try options.sanitizers.sanitizers.map({ sanitizer in
+        return try toolchain.runtimeLibrary(for: sanitizer).pathString
+    })
+
+    // Append any existing value to the front.
+    if let existingValue = env["DYLD_INSERT_LIBRARIES"], !existingValue.isEmpty {
+        runtimes.insert(existingValue, at: 0)
+    }
+
+    env["DYLD_INSERT_LIBRARIES"] = runtimes.joined(separator: ":")
+    return env
+  #endif
+}
+
+/// xUnit XML file generator for a swift-test run.
+final class XUnitGenerator {
+    typealias TestResult = ParallelTestRunner.TestResult
+
+    /// The test results.
+    let results: [TestResult]
+
+    init(_ results: [TestResult]) {
+        self.results = results
+    }
+
+    /// Generate the file at the given path.
+    func generate(at path: AbsolutePath) throws {
+        let stream = BufferedOutputByteStream()
+        stream <<< """
+            <?xml version="1.0" encoding="UTF-8"?>
+
+            """
+        stream <<< "<testsuites>\n"
+
+        // Get the failure count.
+        let failures = results.filter({ !$0.success }).count
+
+        // FIXME: This should contain the right elapsed time.
+        //
+        // We need better output reporting from XCTest.
+        stream <<< """
+            <testsuite name="TestResults" errors="0" tests="\(results.count)" failures="\(failures)" time="0.0">
+
+            """
+
+        // Generate a testcase entry for each result.
+        //
+        // FIXME: This is very minimal right now. We should allow including test output etc.
+        for result in results {
+            let test = result.unitTest
+            stream <<< """
+                <testcase classname="\(test.testCase)" name="\(test.name)" time="0.0">
+
+                """
+
+            if !result.success {
+                stream <<< "<failure message=\"failed\"></failure>\n"
+            }
+
+            stream <<< "</testcase>\n"
+        }
+
+        stream <<< "</testsuite>\n"
+        stream <<< "</testsuites>\n"
+
+        try localFileSystem.writeFileContents(path, bytes: stream.bytes)
+    }
+}
+
+private extension Diagnostic.Message {
+    static var noMatchingTests: Diagnostic.Message {
+        .warning("'--filter' predicate did not match any test case")
     }
 }

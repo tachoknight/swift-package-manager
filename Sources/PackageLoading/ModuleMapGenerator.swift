@@ -8,7 +8,7 @@
  See http://swift.org/CONTRIBUTORS.txt for Swift project authors
  */
 
-import Basic
+import TSCBasic
 import PackageModel
 
 public let moduleMapFilename = "module.modulemap"
@@ -20,7 +20,7 @@ protocol ModuleMapProtocol {
     var moduleMapDirectory: AbsolutePath { get }
 }
 
-extension CTarget: ModuleMapProtocol {
+extension SystemLibraryTarget: ModuleMapProtocol {
     var moduleMapDirectory: AbsolutePath {
         return path
     }
@@ -143,8 +143,8 @@ public struct ModuleMapGenerator {
         let umbrellaHeader = path.appending(component: target.c99name + ".h")
         let invalidUmbrellaHeader = path.appending(component: target.name + ".h")
         if target.c99name != target.name && fileSystem.isFile(invalidUmbrellaHeader) {
-            warningStream <<< ("warning: \(invalidUmbrellaHeader.asString) should be renamed to " +
-                "\(umbrellaHeader.asString) to be used as an umbrella header")
+            warningStream <<< "warning: \(invalidUmbrellaHeader) should be renamed to "
+            warningStream <<< "\(umbrellaHeader) to be used as an umbrella header"
             warningStream.flush()
         }
     }
@@ -159,9 +159,9 @@ public struct ModuleMapGenerator {
         stream <<< "module \(target.c99name) {\n"
         switch type {
         case .header(let header):
-            stream <<< "    umbrella header \"\(header.asString)\"\n"
+            stream <<< "    umbrella header \"\(header.pathString)\"\n"
         case .directory(let path):
-            stream <<< "    umbrella \"\(path.asString)\"\n"
+            stream <<< "    umbrella \"\(path.pathString)\"\n"
         }
         stream <<< "    export *\n"
         stream <<< "}\n"
@@ -173,7 +173,7 @@ public struct ModuleMapGenerator {
 
         // If the file exists with the identical contents, we don't need to rewrite it.
         // Otherwise, compiler will recompile even if nothing else has changed.
-        if let contents = try? localFileSystem.readFileContents(file), contents == stream.bytes {
+        if let contents = try? fileSystem.readFileContents(file), contents == stream.bytes {
             return
         }
         try fileSystem.writeFileContents(file, bytes: stream.bytes)
@@ -183,7 +183,7 @@ public struct ModuleMapGenerator {
 extension ModuleMapGenerator.ModuleMapError: CustomStringConvertible {
     public var description: String {
         switch self {
-        case .unsupportedIncludeLayoutForModule(let (name, problem)):
+        case .unsupportedIncludeLayoutForModule(let name, let problem):
             return "target '\(name)' failed modulemap generation; \(problem)"
         }
     }
@@ -192,17 +192,17 @@ extension ModuleMapGenerator.ModuleMapError: CustomStringConvertible {
 extension ModuleMapGenerator.ModuleMapError.UnsupportedIncludeLayoutType: CustomStringConvertible {
     public var description: String {
         switch self {
-        case .umbrellaHeaderWithAdditionalNonEmptyDirectories(let (umbrella, dirs)):
-            return "umbrella header defined at '\(umbrella.asString)', but directories exist: " +
-                dirs.map({ $0.asString }).sorted().joined(separator: ", ") +
+        case .umbrellaHeaderWithAdditionalNonEmptyDirectories(let umbrella, let dirs):
+            return "umbrella header defined at '\(umbrella)', but directories exist: " +
+                dirs.map({ $0.description }).sorted().joined(separator: ", ") +
                 "; consider removing them"
-        case .umbrellaHeaderWithAdditionalDirectoriesInIncludeDirectory(let (umbrella, dirs)):
-            return "umbrella header defined at '\(umbrella.asString)', but more than one directories exist: " +
-                dirs.map({ $0.asString }).sorted().joined(separator: ", ") +
+        case .umbrellaHeaderWithAdditionalDirectoriesInIncludeDirectory(let umbrella, let dirs):
+            return "umbrella header defined at '\(umbrella)', but more than one directories exist: " +
+                dirs.map({ $0.description }).sorted().joined(separator: ", ") +
                 "; consider reducing them to one"
-        case .umbrellaHeaderWithAdditionalFilesInIncludeDirectory(let (umbrella, files)):
-            return "umbrella header defined at '\(umbrella.asString)', but files exist:" +
-                files.map({ $0.asString }).sorted().joined(separator: ", ") +
+        case .umbrellaHeaderWithAdditionalFilesInIncludeDirectory(let umbrella, let files):
+            return "umbrella header defined at '\(umbrella)', but files exist:" +
+                files.map({ $0.description }).sorted().joined(separator: ", ") +
                 "; consider removing them"
         }
     }

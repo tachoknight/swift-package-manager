@@ -1,7 +1,7 @@
 /*
  This source file is part of the Swift.org open source project
 
- Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+ Copyright (c) 2018 Apple Inc. and the Swift project authors
  Licensed under Apache License v2.0 with Runtime Library Exception
 
  See http://swift.org/LICENSE.txt for license information
@@ -10,21 +10,35 @@
 
 extension Version: ExpressibleByStringLiteral {
 
+    /// Initializes and returns a newly allocated version struct for the provided string literal.
+    ///
+    /// - Parameters:
+    ///     - version: A string literal to use for creating a new version object.
     public init(stringLiteral value: String) {
         if let version = Version(value) {
             self.init(version)
         } else {
-            // If version can't be initialized using the string literal, report the error and initialize with a dummy
-            // value. This is done to fail the invoking tool (like swift build) gracefully rather than just crashing.
-            errors.add("Invalid version string: \(value)")
+            // If version can't be initialized using the string literal, report
+            // the error and initialize with a dummy value. This is done to
+            // report error to the invoking tool (like swift build) gracefully
+            // rather than just crashing.
+            errors.append("Invalid semantic version string '\(value)'")
             self.init(0, 0, 0)
         }
     }
 
+    /// Initializes and returns a newly allocated version struct for the provided extended grapheme cluster.
+    ///
+    /// - Parameters:
+    ///     - version: An extended grapheme cluster to use for creating a new version object.
     public init(extendedGraphemeClusterLiteral value: String) {
         self.init(stringLiteral: value)
     }
 
+    /// Initializes and returns a newly allocated version struct for the provided Unicode string.
+    ///
+    /// - Parameters:
+    ///     - version: A Unicode string to use for creating a new version object.
     public init(unicodeScalarLiteral value: String) {
         self.init(stringLiteral: value)
     }
@@ -32,48 +46,49 @@ extension Version: ExpressibleByStringLiteral {
 
 extension Version {
 
+    /// Initializes and returns a newly allocated version struct for the provided version.
+    ///
+    /// - Parameters:
+    ///     - version: A version object to use for creating a new version object.
     public init(_ version: Version) {
         major = version.major
         minor = version.minor
         patch = version.patch
         prereleaseIdentifiers = version.prereleaseIdentifiers
-        buildMetadataIdentifier = version.buildMetadataIdentifier
+        buildMetadataIdentifiers = version.buildMetadataIdentifiers
     }
 
+    /// Initializes and returns a newly allocated version struct for the provided version string.
+    ///
+    /// - Parameters:
+    ///     - version: A version string to use for creating a new version object.
     public init?(_ versionString: String) {
-        let prereleaseStartIndex = versionString.index(of: "-")
-        let metadataStartIndex = versionString.index(of: "+")
+        let prereleaseStartIndex = versionString.firstIndex(of: "-")
+        let metadataStartIndex = versionString.firstIndex(of: "+")
 
         let requiredEndIndex = prereleaseStartIndex ?? metadataStartIndex ?? versionString.endIndex
         let requiredCharacters = versionString.prefix(upTo: requiredEndIndex)
-        let requiredStringComponents = requiredCharacters
+        let requiredComponents = requiredCharacters
             .split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
             .map(String.init)
-        let requiredComponents = requiredStringComponents.flatMap({ Int($0) }).filter({ $0 >= 0 })
+            .compactMap({ Int($0) })
+            .filter({ $0 >= 0 })
 
-        guard requiredComponents.count == 3 else {
-            return nil
-        }
+        guard requiredComponents.count == 3 else { return nil }
 
         self.major = requiredComponents[0]
         self.minor = requiredComponents[1]
         self.patch = requiredComponents[2]
 
-        if let prereleaseStartIndex = prereleaseStartIndex {
-            let prereleaseEndIndex = metadataStartIndex ?? versionString.endIndex
-            let prereleaseCharacters = versionString[versionString.index(after: prereleaseStartIndex)..<prereleaseEndIndex]
-            prereleaseIdentifiers = prereleaseCharacters.split(separator: ".").map(String.init)
-        } else {
-            prereleaseIdentifiers = []
+        func identifiers(start: String.Index?, end: String.Index) -> [String] {
+            guard let start = start else { return [] }
+            let identifiers = versionString[versionString.index(after: start)..<end]
+            return identifiers.split(separator: ".").map(String.init)
         }
 
-        var buildMetadataIdentifier: String? = nil
-        if let metadataStartIndex = metadataStartIndex {
-            let buildMetadataCharacters = versionString.suffix(from: versionString.index(after: metadataStartIndex))
-            if !buildMetadataCharacters.isEmpty {
-                buildMetadataIdentifier = String(buildMetadataCharacters)
-            }
-        }
-        self.buildMetadataIdentifier = buildMetadataIdentifier
+        self.prereleaseIdentifiers = identifiers(
+            start: prereleaseStartIndex,
+            end: metadataStartIndex ?? versionString.endIndex)
+        self.buildMetadataIdentifiers = identifiers(start: metadataStartIndex, end: versionString.endIndex)
     }
 }
